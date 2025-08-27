@@ -1,0 +1,9 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore virtual environment
+venv/
+
+# Ignore service account key (never push this!)
+*.json
