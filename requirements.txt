@@ -1,0 +1,6 @@
+gspread
+gspread_dataframe
+oauth2client
+pandas
+requests
+numpy
