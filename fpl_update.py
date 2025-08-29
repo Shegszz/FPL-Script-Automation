@@ -6,27 +6,25 @@ from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
 import requests
 import numpy as np
+from google.oauth2.service_account import Credentials
 
-# === HANDLE CREDS FROM GITHUB ACTIONS ===
+# Load service account info from env var
 creds_json = os.getenv("GOOGLE_CREDENTIALS")
-if creds_json:
-    with open("creds.json", "w") as f:
-        f.write(creds_json)
+creds_dict = json.loads(creds_json)
 
-# === AUTH SETUP ===
-sheet_id = os.getenv("GOOGLE_SHEET_ID")
-creds_path = "creds.json"
-
-scope = [
-    "https://spreadsheets.google.com/feeds",
+# Define the required scopes
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
-client = gspread.authorize(creds)
+# Authenticate
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+client = gspread.authorize(credentials)
 
+# Open Google Sheet
+sheet_id = os.getenv("GOOGLE_SHEET_ID")
 sheet = client.open_by_key(sheet_id)
-
 
 # === FUNCTION TO WRITE DATA TO SEPARATE SHEETS ===
 def write_to_sheet(sheet, df, sheet_name):
