@@ -32,7 +32,11 @@ def write_to_sheet(sheet, df, sheet_name):
     try:
         worksheet = sheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
+        worksheet = sheet.add_worksheet(
+            title=sheet_name,
+            rows=str(len(df) + 5),
+            cols=str(len(df.columns) + 5)
+        )
     
     worksheet.clear()  # Clear previous content
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
