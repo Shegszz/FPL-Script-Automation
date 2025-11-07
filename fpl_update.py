@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import gspread
 from gspread_dataframe import set_with_dataframe
 from oauth2client.service_account import ServiceAccountCredentials
@@ -26,9 +27,9 @@ client = gspread.authorize(credentials)
 sheet_id = os.getenv("GOOGLE_SHEET_ID")
 sheet = client.open_by_key(sheet_id)
 
-# === FUNCTION TO WRITE DATA TO SEPARATE SHEETS ===
+# === CHANGED START ===
+# Upgraded write_to_sheet: create worksheet if missing (prevents failures when tab deleted)
 def write_to_sheet(sheet, df, sheet_name):
-    # Create or open the sheet
     try:
         worksheet = sheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
@@ -37,10 +38,11 @@ def write_to_sheet(sheet, df, sheet_name):
             rows=str(len(df) + 5),
             cols=str(len(df.columns) + 5)
         )
-    
     worksheet.clear()  # Clear previous content
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
     worksheet.freeze(rows=1, cols=2)
+    print(f"✅ Successfully wrote to {sheet_name}")
+# === CHANGED END ===
 
 #1 FPL API endpoints
 fpl_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
@@ -229,10 +231,11 @@ for player in players:
         # Join difficulties (e.g., [3, 5] becomes "3, 5")
         difficulty_combined = ', '.join(map(str, opponent_info['difficulty']))
 
+        # Note: original column names use GW["name"], which is like "Gameweek 11"
         player_data[f'{gw["name"]}'] = opponent_combined
         player_data[f'{gw["name"]} Difficulty'] = difficulty_combined
-        
-        # Add expected goals for last two Gameweeks to calculate change in delta G & change in delta GI
+
+    # Add expected goals for last two Gameweeks to calculate change in delta G & change in delta GI
     player_data['XG Current GW'] = float(current_gw_xg.get(player['id'], 0))
     player_data['XG Previous GW'] = float(previous_gw_xg.get(player['id'], 0))
     player_data['ΔG_GW'] = player_data['XG Current GW'] - player_data['XG Previous GW']  
@@ -262,6 +265,55 @@ for player in players:
 player_df = pd.DataFrame(player_info)
 
 
+# === CHANGED START ===
+# Normalize dynamic Gameweek columns into stable Next GW Opponent i and Next GW Difficulty i columns
+# This avoids having to change Tableau when new GW columns appear
+
+# identify difficulty columns like "Gameweek 11 Difficulty"
+difficulty_cols = [col for col in player_df.columns if re.match(r'Gameweek\s+\d+\s+Difficulty$', col)]
+# identify opponent columns like "Gameweek 11"
+opponent_cols = [col for col in player_df.columns if re.match(r'Gameweek\s+\d+$', col)]
+
+# sort by the GW number (extract the number)
+def gw_number(colname):
+    m = re.search(r'Gameweek\s+(\d+)', colname)
+    return int(m.group(1)) if m else 0
+
+difficulty_cols_sorted = sorted(difficulty_cols, key=gw_number)
+opponent_cols_sorted = sorted(opponent_cols, key=gw_number)
+
+# rename to stable names: Next GW Difficulty 1..N and Next GW Opponent 1..N
+for i, col in enumerate(difficulty_cols_sorted, start=1):
+    new_name = f'Next GW Difficulty {i}'
+    player_df.rename(columns={col: new_name}, inplace=True)
+
+for i, col in enumerate(opponent_cols_sorted, start=1):
+    new_name = f'Next GW Opponent {i}'
+    player_df.rename(columns={col: new_name}, inplace=True)
+
+# If there are fewer than expected (e.g., <5) still create empty columns up to number of next_5_gameweeks to keep schema stable
+max_next = max(1, len(next_5_gameweeks))
+for i in range(1, max_next + 1):
+    diff_col = f'Next GW Difficulty {i}'
+    opp_col = f'Next GW Opponent {i}'
+    if diff_col not in player_df.columns:
+        player_df[diff_col] = np.nan
+    if opp_col not in player_df.columns:
+        player_df[opp_col] = ''
+
+# Create a single "Next GW Difficulty" column (maps to the first upcoming GW)
+player_df['Next GW Difficulty'] = player_df['Next GW Difficulty 1']
+# Create list column Next 5 GW FDR from normalized columns
+player_df['Next 5 GW FDR'] = player_df.apply(
+    lambda row: [row.get(f'Next GW Difficulty {i}', np.nan) for i in range(1, max_next + 1)],
+    axis=1
+)
+
+# Convenience column for first upcoming opponent(s)
+player_df['Next GW Opponent'] = player_df['Next GW Opponent 1']
+
+# === CHANGED END ===
+
 pd.set_option('display.max.columns', 75)
 #2 Helper function to safely parse Difficulty values
 def parse_difficulty(val):
@@ -270,56 +322,67 @@ def parse_difficulty(val):
     elif isinstance(val, str):
         # Split by comma and convert to float
         try:
-            return sum(float(x.strip()) for x in val.split(','))
+            return sum(float(x.strip()) for x in val.split(',') if x.strip() != '')
         except ValueError:
             return 0  # Handle malformed values gracefully
     elif isinstance(val, (int, float)):
         return float(val)
     return 0
 
-# Calculate the summation of the difficulty scores for the next 5 gameweeks
+# Calculate the summation of the difficulty scores for the next N gameweeks
 player_df['Difficulty Score'] = player_df.apply(
     lambda row: sum(
-        parse_difficulty(row.get(f'{gw["name"]} Difficulty', 0))
-        for gw in next_5_gameweeks
+        parse_difficulty(row.get(f'Next GW Difficulty {i}', 0))
+        for i in range(1, max_next + 1)
     ), axis=1
 )
 
-# FD Index calculation (for the next 5 gameweeks)
-player_df['FD Index'] = (player_df['Form'].astype(float) / player_df['Difficulty Score']).round(2)
-
-# Next GW Difficulty: Sum of difficulties in first upcoming GW (handles double fixtures)
-player_df['Next GW Difficulty'] = player_df[f'{next_5_gameweeks[0]["name"]} Difficulty'].apply(parse_difficulty)
-
-# Add a column that includes the difficulty scores for the next 5 gameweeks as a list
-player_df['Next 5 GW FDR'] = player_df.apply(
-    lambda row: [
-        parse_difficulty(row.get(f'{gw["name"]} Difficulty')) for gw in next_5_gameweeks
-    ], axis=1
+# FD Index calculation (for the next N gameweeks)
+# Avoid division by zero
+player_df['FD Index'] = player_df.apply(
+    lambda r: round(float(r['Form']) / r['Difficulty Score'], 2) if r['Difficulty Score'] not in (0, np.nan) else np.nan,
+    axis=1
 )
 
-# Add columns for the next 5 opponents using the gameweek names
-for gw in next_5_gameweeks:
-    player_df[f'{gw["name"]} Opponent'] = player_df.apply(
-        lambda row: row.get(f'{gw["name"]}', ''), axis=1
-    )
+# Next GW Difficulty: parse the first upcoming GW difficulty (handles double fixtures in string)
+player_df['Next GW Difficulty'] = player_df['Next GW Difficulty'].apply(parse_difficulty)
 
-# Table creation function
+# Ensure Next 5 GW FDR list is numeric (parsed)
+player_df['Next 5 GW FDR'] = player_df['Next 5 GW FDR'].apply(
+    lambda lst: [parse_difficulty(x) for x in lst]
+)
+
+# Add columns for the next N opponents using the normalized names (already present as Next GW Opponent i)
+for i in range(1, max_next + 1):
+    player_df[f'Next GW Opponent {i}'] = player_df.get(f'Next GW Opponent {i}', '')
+
+# Table creation function — updated to reference normalized Next GW columns instead of gw["name"]
 def create_Gw_transfers_in_table(position_name):
-    return player_df[player_df['Position'] == position_name][[
-        'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Goals', 'Assists', 'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Expected points Next GW', 'Total Points', 'Difficulty Score', 
-    ] + [col for gw in next_5_gameweeks for col in [f'{gw["name"]}', f'{gw["name"]} Difficulty']] + [
-        'GW Transfers In', 'GW Transfers Out'
-    ]].sort_values(by='GW Transfers In', ascending=False)
+    # base columns (kept exactly as your original intent)
+    base_cols = [
+        'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Goals', 'Assists',
+        'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points',
+        'Expected points Next GW', 'Total Points', 'Difficulty Score'
+    ]
+    # add normalized Next GW Opponent and Difficulty columns
+    next_gw_cols = []
+    for i in range(1, max_next + 1):
+        next_gw_cols.append(f'Next GW Opponent {i}')
+        next_gw_cols.append(f'Next GW Difficulty {i}')
+    # final columns
+    final_cols = base_cols + next_gw_cols + ['GW Transfers In', 'GW Transfers Out']
+    # filter by position and select available columns
+    df = player_df[player_df['Position'] == position_name]
+    # ensure only existing columns are selected (in case of schema differences)
+    selected_cols = [c for c in final_cols if c in df.columns]
+    return df[selected_cols].sort_values(by='GW Transfers In', ascending=False)
 
 # Create transfer pick tables for each position
 goalkeepers_Gw_transfers_in = create_Gw_transfers_in_table('Goalkeeper')
 defenders_Gw_transfers_in = create_Gw_transfers_in_table('Defender')
 midfielders_Gw_transfers_in = create_Gw_transfers_in_table('Midfielder')
 forwards_Gw_transfers_in = create_Gw_transfers_in_table('Forward')
-#managers_Gw_transfers_in = create_Gw_transfers_table('Manager')
-    
-    
+
 #3 === FETCH DATA AND PREPARE TEAM DATA ===
 # Fetch data from FPL API
 teams_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
@@ -377,10 +440,6 @@ for fixture in fixtures_data:
 teams_df['Last 5 GW Results'] = teams_df['id'].apply(lambda tid: ', '.join(team_results[tid][-5:]))
 
 # Calculate additional metrics
-#teams_df['Goals Scored/Game'] = (teams_df['Goals Scored'] / teams_df['Games'].replace(0, pd.NA)).round(1)
-#teams_df['Goals Conceded/Game'] = (teams_df['Goals Conceded'] / teams_df['Games'].replace(0, pd.NA)).round(1)
-#teams_df['Goal Difference'] = teams_df['Goals Scored'] - teams_df['Goals Conceded']
-
 teams_df['Goals Scored/Game'] = (
     teams_df['Goals Scored'] / teams_df['Games'].replace(0, np.nan)
 ).round(1)
