@@ -303,7 +303,7 @@ for gw in next_5_gameweeks:
 # Table creation function
 def create_Gw_transfers_in_table(position_name):
     return player_df[player_df['Position'] == position_name][[
-        'Player Name','Availability', 'Team', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Goals', 'Assists', 'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Expected points Next GW', 'Total Points', 'Difficulty Score', 
+        'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Goals', 'Assists', 'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Expected points Next GW', 'Total Points', 'Difficulty Score', 
     ] + [col for gw in next_5_gameweeks for col in [f'{gw["name"]}', f'{gw["name"]} Difficulty']] + [
         'GW Transfers In', 'GW Transfers Out'
     ]].sort_values(by='GW Transfers In', ascending=False)
