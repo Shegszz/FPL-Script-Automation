@@ -52,18 +52,18 @@ teams = {team['id']: team['short_name'] for team in data['teams']}  # Use short 
 positions = {position['id']: position['singular_name'] for position in data['element_types']}
 events = data['events']
 
-# Current Gameweek and the next 5 Gameweeks
+# Current Gameweek
 current_gameweek = None
-next_5_gameweeks = []
-found_next = False
-
 for event in events:
     if event['is_current']:
         current_gameweek = event['id']
-    if event['is_next']:
-        found_next = True
-    if found_next and len(next_5_gameweeks) < 5:
-        next_5_gameweeks.append({'id': event['id'], 'name': event['name']})
+
+# === EDIT START ===
+# Use absolute next 5 gameweeks based on current GW (instead of is_next flag)
+next_5_gameweeks = [e for e in events if e['id'] > current_gameweek][:5]
+# Format as dicts with id and name
+next_5_gameweeks = [{'id': gw['id'], 'name': gw['name']} for gw in next_5_gameweeks]
+# === EDIT END ===
 
 # Fetch fixture data
 fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
@@ -113,8 +113,8 @@ def fetch_gameweek_data(gameweek):
         raise Exception(f"Failed to fetch data for Gameweek {gameweek}")
 
 # Fetch expected goals for last two Gameweeks
-current_gw = current_gameweek  # Current GW
-previous_gw = current_gameweek - 1 if current_gameweek and current_gameweek > 1 else None  # Only valid if GW > 1
+current_gw = current_gameweek
+previous_gw = current_gameweek - 1 if current_gameweek and current_gameweek > 1 else None
 
 current_gw_data = fetch_gameweek_data(current_gw) if current_gw else {}
 previous_gw_data = fetch_gameweek_data(previous_gw) if previous_gw else {}
@@ -138,10 +138,8 @@ def extract_expected_goal_involvements(gw_data):
         xgi_data[player_id] = stats['expected_goal_involvements']
     return xgi_data
 
-# Extract xG and xGI only if the data exists
 current_gw_xg = extract_expected_goals(current_gw_data) if current_gw_data else {}
 previous_gw_xg = extract_expected_goals(previous_gw_data) if previous_gw_data else {}
-
 current_gw_xgi = extract_expected_goal_involvements(current_gw_data) if current_gw_data else {}
 previous_gw_xgi = extract_expected_goal_involvements(previous_gw_data) if previous_gw_data else {}
 
@@ -157,7 +155,7 @@ for player in players:
         'Form': player['form'],
         'Team': teams[player['team']],
         'Position': positions[player['element_type']],
-        'Cost': player['now_cost'] / 10,  # Cost is in tenths of a million
+        'Cost': player['now_cost'] / 10,
         'GW Points': player['event_points'],
         'Expected points Current GW': player['ep_this'],
         'Expected points Next GW': player['ep_next'],
@@ -211,46 +209,36 @@ for player in players:
         'Goals Conceded/90': player['goals_conceded_per_90'],
         'Current Gameweek': current_gameweek
     }
+
     # Add next 5 Gameweeks' opponents and difficulty scores with the gameweek names
     for i, gw in enumerate(next_5_gameweeks, start=1):
         opponent_info = team_opponents[player['team']][gw['id']]
 
-        # Combine multiple opponents if double GW
         opponents_with_venue = []
         for opp, venue in zip(opponent_info['opponent'], opponent_info['home_away']):
             opponents_with_venue.append(f"{opp}{venue[-3:]}")
 
-        # Join opponents (e.g., "ARS(H), MCI(A)" if double)
         opponent_combined = ', '.join(opponents_with_venue)
-
-        # Join difficulties (e.g., [3, 5] becomes "3, 5")
         difficulty_combined = ', '.join(map(str, opponent_info['difficulty']))
 
         player_data[f'{gw["name"]}'] = opponent_combined
         player_data[f'{gw["name"]} Difficulty'] = difficulty_combined
-        
-        # Add expected goals for last two Gameweeks to calculate change in delta G & change in delta GI
+
     player_data['XG Current GW'] = float(current_gw_xg.get(player['id'], 0))
     player_data['XG Previous GW'] = float(previous_gw_xg.get(player['id'], 0))
     player_data['ΔG_GW'] = player_data['XG Current GW'] - player_data['XG Previous GW']  
-    
+
     player_data['XGI Current GW'] = float(current_gw_xgi.get(player['id'], 0))  
     player_data['XGI Previous GW'] = float(previous_gw_xgi.get(player['id'], 0))
     player_data['ΔGI'] = player_data['XGI Current GW'] - player_data['XGI Previous GW'] 
 
-    # Convert columns to float where necessary
     player_data['Goals'] = float(player_data['Goals'])
     player_data['Assists'] = float(player_data['Assists'])
     player_data['XG'] = float(player_data['XG'])
     player_data['XGI'] = float(player_data['XGI'])
 
-    # Calculate Goal Involvements (GI) as Goals + Assists
     player_data['GI'] = player_data['Goals'] + player_data['Assists']
-
-    # Calculate Delta G (Goals - Expected Goals)
     player_data['Delta G'] = player_data['Goals'] - player_data['XG']
-
-    # Calculate Delta GI (Goal Involvements - Expected Goal Involvements)
     player_data['Delta GI'] = player_data['GI'] - player_data['XGI']
 
     player_info.append(player_data)
@@ -258,17 +246,11 @@ for player in players:
 # Convert the list of player information into a DataFrame
 player_df = pd.DataFrame(player_info)
 
-
-# === CHANGED START ===
+# === EDIT START ===
 # Normalize dynamic Gameweek columns into stable Next GW Opponent i and Next GW Difficulty i columns
-# This avoids having to change Tableau when new GW columns appear
-
-# identify difficulty columns like "Gameweek 11 Difficulty"
 difficulty_cols = [col for col in player_df.columns if re.match(r'Gameweek\s+\d+\s+Difficulty$', col)]
-# identify opponent columns like "Gameweek 11"
 opponent_cols = [col for col in player_df.columns if re.match(r'Gameweek\s+\d+$', col)]
 
-# sort by the GW number (extract the number)
 def gw_number(colname):
     m = re.search(r'Gameweek\s+(\d+)', colname)
     return int(m.group(1)) if m else 0
@@ -276,7 +258,6 @@ def gw_number(colname):
 difficulty_cols_sorted = sorted(difficulty_cols, key=gw_number)
 opponent_cols_sorted = sorted(opponent_cols, key=gw_number)
 
-# rename to stable names: Next GW Difficulty 1..N and Next GW Opponent 1..N
 for i, col in enumerate(difficulty_cols_sorted, start=1):
     new_name = f'Next GW Difficulty {i}'
     player_df.rename(columns={col: new_name}, inplace=True)
@@ -285,7 +266,6 @@ for i, col in enumerate(opponent_cols_sorted, start=1):
     new_name = f'Next GW Opponent {i}'
     player_df.rename(columns={col: new_name}, inplace=True)
 
-# If there are fewer than expected (e.g., <5) still create empty columns up to number of next_5_gameweeks to keep schema stable
 max_next = max(1, len(next_5_gameweeks))
 for i in range(1, max_next + 1):
     diff_col = f'Next GW Difficulty {i}'
@@ -295,18 +275,13 @@ for i in range(1, max_next + 1):
     if opp_col not in player_df.columns:
         player_df[opp_col] = ''
 
-# Create a single "Next GW Difficulty" column (maps to the first upcoming GW)
 player_df['Next GW Difficulty'] = player_df['Next GW Difficulty 1']
-# Create list column Next 5 GW FDR from normalized columns
 player_df['Next 5 GW FDR'] = player_df.apply(
     lambda row: [row.get(f'Next GW Difficulty {i}', np.nan) for i in range(1, max_next + 1)],
     axis=1
 )
-
-# Convenience column for first upcoming opponent(s)
 player_df['Next GW Opponent'] = player_df['Next GW Opponent 1']
-
-# === CHANGED END ===
+# === EDIT END ===
 
 pd.set_option('display.max.columns', 75)
 #2 Helper function to safely parse Difficulty values
@@ -356,7 +331,7 @@ def create_Gw_transfers_in_table(position_name):
     base_cols = [
         'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Goals', 'Assists',
         'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points',
-        'Expected points Next GW', 'Total Points', 'Difficulty Score'
+        'Expected points Next GW', 'Total Points', 'Difficulty Score', 'Current Gameweek'
     ]
     # add normalized Next GW Opponent and Difficulty columns
     next_gw_cols = []
