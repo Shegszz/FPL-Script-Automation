@@ -154,6 +154,8 @@ for player in players:
         'Form': player['form'],
         'Team': teams[player['team']],
         'Position': positions[player['element_type']],
+        'Defensive Contributions': player['defensive_contribution'],
+        'Defensive Contributions/90': player['defensive_contribution_per_90'],
         'Cost': player['now_cost'] / 10,
         'GW Points': player['event_points'],
         'Expected points Current GW': player['ep_this'],
@@ -329,9 +331,9 @@ for i in range(1, max_next + 1):
 def create_Gw_transfers_in_table(position_name):
     # base columns (kept exactly as your original intent)
     base_cols = [
-        'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Goals', 'Assists',
-        'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points',
-        'Expected points Next GW', 'Total Points', 'Difficulty Score', 'Current Gameweek'
+        'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Saves', 'Starts', 'Minutes', 'Yellow Cards', 'Red Cards' 'Defensive Contributions', 'Defensive Contributions/90', 'Goals', 'Assists',
+        'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Points/Game',
+        'Expected points Next GW', 'Total Points', 'Difficulty Score', 'Total Bonus Point', 'Current Gameweek'
     ]
     # add normalized Next GW Opponent and Difficulty columns
     next_gw_cols = []
