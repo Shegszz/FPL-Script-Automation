@@ -9,6 +9,9 @@ import requests
 import numpy as np
 from google.oauth2.service_account import Credentials
 
+# CHANGE #1: Import ML module
+from fpl_ml_model import add_ml_predictions
+
 # Load service account info from env var
 creds_json = os.getenv("GOOGLE_CREDENTIALS")
 creds_dict = json.loads(creds_json)
@@ -34,7 +37,7 @@ def write_to_sheet(sheet, df, sheet_name):
         worksheet = sheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         worksheet = sheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
-    
+   
     worksheet.clear()  # Clear previous content
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
     worksheet.freeze(rows=1, cols=2)
@@ -90,13 +93,13 @@ for fixture in fixtures:
     away_team_id = fixture['team_a']
     home_difficulty = fixture['team_h_difficulty']
     away_difficulty = fixture['team_a_difficulty']
-    
+   
     if any(gw['id'] == event_id for gw in next_5_gameweeks):
         # Home team
         team_opponents[home_team_id][event_id]['opponent'].append(teams[away_team_id])
         team_opponents[home_team_id][event_id]['difficulty'].append(home_difficulty)
         team_opponents[home_team_id][event_id]['home_away'].append(f'{teams[home_team_id]}(H)')
-        
+       
         # Away team
         team_opponents[away_team_id][event_id]['opponent'].append(teams[home_team_id])
         team_opponents[away_team_id][event_id]['difficulty'].append(away_difficulty)
@@ -231,7 +234,7 @@ for player in players:
 
     player_data['XGI Current GW'] = float(current_gw_xgi.get(player['id'], 0))  
     player_data['XGI Previous GW'] = float(previous_gw_xgi.get(player['id'], 0))
-    player_data['ΔGI'] = player_data['XGI Current GW'] - player_data['XGI Previous GW'] 
+    player_data['ΔGI'] = player_data['XGI Current GW'] - player_data['XGI Previous GW']
 
     player_data['Goals'] = float(player_data['Goals'])
     player_data['Assists'] = float(player_data['Assists'])
@@ -246,6 +249,37 @@ for player in players:
 
 # Convert the list of player information into a DataFrame
 player_df = pd.DataFrame(player_info)
+
+
+# ⭐⭐⭐ CHANGE #2: ML PREDICTION SECTION - START ⭐⭐⭐
+# =============================================================================
+# ML PREDICTION - ADD xP (Expected Points)
+# =============================================================================
+try:
+    print("\n" + "="*70)
+    print("🤖 MACHINE LEARNING PREDICTIONS")
+    print("="*70)
+    
+    # Set retrain=True to retrain model, False to use cached
+    # Retrain once per week, use cached for daily updates
+    retrain_model = False  # Change to True to retrain
+    
+    player_df, ml_model = add_ml_predictions(player_df, retrain=retrain_model)
+    
+    print(f"✅ ML predictions added to player_df")
+    print(f"   New columns: xP, xP_confidence, AI_Rating")
+    
+except Exception as e:
+    print(f"⚠️  ML prediction failed: {str(e)}")
+    print("   Continuing with standard metrics...")
+    # Add dummy columns so code doesn't break
+    player_df['xP'] = player_df['Form'].astype(float)
+    player_df['xP_confidence'] = 0
+    player_df['AI_Rating'] = 'N/A'
+
+# =============================================================================
+# END OF ML SECTION
+# =============================================================================
 
 
 # === EDIT START ===
@@ -327,11 +361,14 @@ player_df['Next 5 GW FDR'] = player_df['Next 5 GW FDR'].apply(
 for i in range(1, max_next + 1):
     player_df[f'Next GW Opponent {i}'] = player_df.get(f'Next GW Opponent {i}', '')
 
+# ⭐⭐⭐ CHANGE #3: Update table function to include xP columns - START ⭐⭐⭐
 # Table creation function — updated to reference normalized Next GW columns instead of gw["name"]
 def create_Gw_transfers_in_table(position_name):
     # base columns (kept exactly as your original intent)
     base_cols = [
-        'Player Name','Availability', 'Team', 'Position', 'Cost', 'Form', 'FD Index', 'XG', 'Clean Sheets', 'Saves', 'Starts', 'Minutes', 'Yellow Cards', 'Red Cards', 'Defensive Contributions', 'Defensive Contributions/90', 'Goals', 'Assists',
+        'Player Name','Availability', 'Team', 'Position', 'Cost', 
+        'xP', 'xP_confidence', 'AI_Rating',  # ⭐ ADDED ML COLUMNS
+        'Form', 'FD Index', 'XG', 'Clean Sheets', 'Saves', 'Starts', 'Minutes', 'Yellow Cards', 'Red Cards', 'Defensive Contributions', 'Defensive Contributions/90', 'Goals', 'Assists',
         'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Points/Game',
         'Expected points Next GW', 'Total Points', 'Difficulty Score', 'Total Bonus Point', 'Current Gameweek'
     ]
@@ -347,6 +384,7 @@ def create_Gw_transfers_in_table(position_name):
     # ensure only existing columns are selected (in case of schema differences)
     selected_cols = [c for c in final_cols if c in df.columns]
     return df[selected_cols].sort_values(by='GW Transfers In', ascending=False)
+# ⭐⭐⭐ CHANGE #3: END ⭐⭐⭐
 
 
 # Create transfer pick tables for each position
@@ -355,12 +393,12 @@ defenders_Gw_transfers_in = create_Gw_transfers_in_table('Defender')
 midfielders_Gw_transfers_in = create_Gw_transfers_in_table('Midfielder')
 forwards_Gw_transfers_in = create_Gw_transfers_in_table('Forward')
 #managers_Gw_transfers_in = create_Gw_transfers_table('Manager')
-    
-    
+   
+   
 #3 === FETCH DATA AND PREPARE TEAM DATA ===
 # Fetch data from FPL API
 teams_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
-fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
+fixtures_url = 'https://api.fantasy.premierleague.com/api/fixtures/'
 
 teams_data = requests.get(teams_url).json()['teams']
 fixtures_data = requests.get(fixtures_url).json()
@@ -430,14 +468,14 @@ teams_df['Goal Difference'] = teams_df['Goals Scored'] - teams_df['Goals Concede
 
 # Create the tables
 attacking_teams = teams_df.sort_values(by=['Goals Scored/Game', 'Goals Scored', 'Goal Difference'], ascending=[False, False, False])[[
-    'Team', 'Games', 'Goals Scored/Game', 'Goals Conceded/Game', 'Goals Scored', 
+    'Team', 'Games', 'Goals Scored/Game', 'Goals Conceded/Game', 'Goals Scored',
     'Goals Conceded', 'Goal Difference', 'Last 5 GW Results'
 ]].rename(columns={
     'team': 'Team'
 })
 attacking_teams['Last Updated'] = pd.to_datetime('now')
 defensive_teams = teams_df.sort_values(by=['Goals Conceded/Game', 'Goals Conceded'], ascending=[True, True])[[  
-    'Team', 'Games', 'Goals Conceded/Game', 'Goals Conceded', 'Goals Scored/Game', 
+    'Team', 'Games', 'Goals Conceded/Game', 'Goals Conceded', 'Goals Scored/Game',
     'Goals Scored', 'Goal Difference', 'Last 5 GW Results'
 ]].rename(columns={
     'team': 'Team'
@@ -453,31 +491,31 @@ status_code_info = [
     ["'s'", "Suspended – Missing due to red/yellow cards"],
     ["'u'", "Unavailable – Non-injury reason (e.g. transfer, international duty)"],
     ["'n'", "Not in squad – Possibly dropped or rotated"],
-    
+   
     [],
     ["Metric", "Definition", "FPL Usage Tip"],
-    ["FD Index (Form / Fixture Difficulty)", 
-     "Highlights in-form players with favorable upcoming fixtures", 
+    ["FD Index (Form / Fixture Difficulty)",
+     "Highlights in-form players with favorable upcoming fixtures",
      "Pick players in form with easy matches ahead"],
-    
-    ["xG (Expected Goals)", 
-     "Predicts goal-scoring potential based on shot quality", 
+   
+    ["xG (Expected Goals)",
+     "Predicts goal-scoring potential based on shot quality",
      "Helps find players likely to score"],
-    
-    ["Delta G (Goals - xG)", 
-     "Reveals finishing efficiency or over/underperformance", 
+   
+    ["Delta G (Goals - xG)",
+     "Reveals finishing efficiency or over/underperformance",
      "Spot clinical finishers or potential regressions"],
-    
-    ["xA (Expected Assists)", 
-     "Gauges assist potential from creative passing", 
+   
+    ["xA (Expected Assists)",
+     "Gauges assist potential from creative passing",
      "Pick players with high assist potential"],
-    
+   
     ["ΔG_gw (Also Delta G/gameweek = Current GW XG - Previous GW XG)",
-     "How much a player’s involvement in expected goals has changed from last week to this week",
-     "Helps you track a player’s weekly attacking momentum(+ve ΔG_gw means this week's in-form players while -ve ΔG_gw are perfoming less than the previous week)"],
-    
-    ["Delta GI (Goal Involvements - [xG + xA])", 
-     "Shows actual impact vs expected contribution", 
+     "How much a player's involvement in expected goals has changed from last week to this week",
+     "Helps you track a player's weekly attacking momentum(+ve ΔG_gw means this week's in-form players while -ve ΔG_gw are perfoming less than the previous week)"],
+   
+    ["Delta GI (Goal Involvements - [xG + xA])",
+     "Shows actual impact vs expected contribution",
      "Identify players who consistently outperform stats(positive XG are performing more than expected while negative XG are performing below expectation)"]
 ]
 # Convert the list of lists to a DataFrame
