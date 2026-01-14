@@ -398,7 +398,7 @@ forwards_Gw_transfers_in = create_Gw_transfers_in_table('Forward')
 #3 === FETCH DATA AND PREPARE TEAM DATA ===
 # Fetch data from FPL API
 teams_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
-fixtures_url = 'https://api.fantasy.premierleague.com/api/fixtures/'
+fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
 
 teams_data = requests.get(teams_url).json()['teams']
 fixtures_data = requests.get(fixtures_url).json()
