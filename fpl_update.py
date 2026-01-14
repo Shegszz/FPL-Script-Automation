@@ -8,8 +8,9 @@ import pandas as pd
 import requests
 import numpy as np
 from google.oauth2.service_account import Credentials
+import time
 
-# CHANGE #1: Import ML module
+# ⭐ CHANGE #1: Import ML module
 from fpl_ml_model import add_ml_predictions
 
 # Load service account info from env var
@@ -42,12 +43,44 @@ def write_to_sheet(sheet, df, sheet_name):
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
     worksheet.freeze(rows=1, cols=2)
 
+# ✅ HELPER FUNCTION: Safe API call with retry logic
+def fetch_fpl_data(url, max_retries=3):
+    """
+    Fetch data from FPL API with error handling and retries
+    """
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()  # Raise error for bad status codes
+            return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print(f"⚠️  JSON decode error on attempt {attempt + 1}: {e}")
+            print(f"   Response text: {response.text[:200]}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # Wait before retry
+                continue
+            else:
+                print(f"❌ Failed after {max_retries} attempts")
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️  Request error on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            else:
+                print(f"❌ Failed after {max_retries} attempts")
+                return None
+    return None
+
 #1 FPL API endpoints
 fpl_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
 
 # Fetch FPL Data
-response = requests.get(fpl_url)
-data = response.json()
+print("Fetching bootstrap data...")
+data = fetch_fpl_data(fpl_url)
+
+if data is None:
+    raise Exception("Failed to fetch bootstrap data from FPL API")
 
 # Extract player data
 players = data['elements']
@@ -67,16 +100,13 @@ next_5_gameweeks = [e for e in events if e['id'] > current_gameweek][:5]
 next_5_gameweeks = [{'id': gw['id'], 'name': gw['name']} for gw in next_5_gameweeks]
 # === EDIT END ===
 
-# Fetch fixture data
+# ✅ FIXED: Fetch fixture data with error handling
 fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
-fixtures_response = requests.get(fixtures_url)
+print("Fetching fixtures data...")
+fixtures = fetch_fpl_data(fixtures_url)
 
-# Check for valid JSON
-try:
-    fixtures = fixtures_response.json()
-except requests.exceptions.JSONDecodeError:
-    print("Error: Received an invalid JSON response from the fixtures endpoint.")
-    print("Response content:", fixtures_response.text)
+if fixtures is None:
+    print("⚠️  Warning: Could not fetch fixtures. Continuing with empty fixtures.")
     fixtures = []
 
 # Create dictionary to store the opponents and difficulty scores for each team's Gameweek
@@ -88,13 +118,13 @@ team_opponents = {
 
 # Fill dictionary with all opponents (supports double Gameweeks)
 for fixture in fixtures:
-    event_id = fixture['event']
-    home_team_id = fixture['team_h']
-    away_team_id = fixture['team_a']
-    home_difficulty = fixture['team_h_difficulty']
-    away_difficulty = fixture['team_a_difficulty']
+    event_id = fixture.get('event')
+    home_team_id = fixture.get('team_h')
+    away_team_id = fixture.get('team_a')
+    home_difficulty = fixture.get('team_h_difficulty')
+    away_difficulty = fixture.get('team_a_difficulty')
    
-    if any(gw['id'] == event_id for gw in next_5_gameweeks):
+    if event_id and home_team_id and away_team_id and any(gw['id'] == event_id for gw in next_5_gameweeks):
         # Home team
         team_opponents[home_team_id][event_id]['opponent'].append(teams[away_team_id])
         team_opponents[home_team_id][event_id]['difficulty'].append(home_difficulty)
@@ -108,11 +138,9 @@ for fixture in fixtures:
 # Fetch Gameweek data for expected goals
 def fetch_gameweek_data(gameweek):
     url = f'https://fantasy.premierleague.com/api/event/{gameweek}/live/'
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(f"Failed to fetch data for Gameweek {gameweek}")
+    print(f"Fetching gameweek {gameweek} data...")
+    gw_data = fetch_fpl_data(url)
+    return gw_data if gw_data else {}
 
 # Fetch expected goals for last two Gameweeks
 current_gw = current_gameweek
@@ -123,27 +151,31 @@ previous_gw_data = fetch_gameweek_data(previous_gw) if previous_gw else {}
 
 # Extract expected goals (xG) data for players
 def extract_expected_goals(gw_data):
+    if not gw_data or 'elements' not in gw_data:
+        return {}
     players_stats = gw_data['elements']
     xg_data = {}
     for player in players_stats:
         player_id = player['id']
         stats = player['stats']
-        xg_data[player_id] = stats['expected_goals']
+        xg_data[player_id] = stats.get('expected_goals', 0)
     return xg_data
 
 def extract_expected_goal_involvements(gw_data):
+    if not gw_data or 'elements' not in gw_data:
+        return {}
     players_stats = gw_data['elements']
     xgi_data = {}
     for player in players_stats:
         player_id = player['id']
         stats = player['stats']
-        xgi_data[player_id] = stats['expected_goal_involvements']
+        xgi_data[player_id] = stats.get('expected_goal_involvements', 0)
     return xgi_data
 
-current_gw_xg = extract_expected_goals(current_gw_data) if current_gw_data else {}
-previous_gw_xg = extract_expected_goals(previous_gw_data) if previous_gw_data else {}
-current_gw_xgi = extract_expected_goal_involvements(current_gw_data) if current_gw_data else {}
-previous_gw_xgi = extract_expected_goal_involvements(previous_gw_data) if previous_gw_data else {}
+current_gw_xg = extract_expected_goals(current_gw_data)
+previous_gw_xg = extract_expected_goals(previous_gw_data)
+current_gw_xgi = extract_expected_goal_involvements(current_gw_data)
+previous_gw_xgi = extract_expected_goal_involvements(previous_gw_data)
 
 # Create a list of player information
 player_info = []
@@ -392,16 +424,23 @@ goalkeepers_Gw_transfers_in = create_Gw_transfers_in_table('Goalkeeper')
 defenders_Gw_transfers_in = create_Gw_transfers_in_table('Defender')
 midfielders_Gw_transfers_in = create_Gw_transfers_in_table('Midfielder')
 forwards_Gw_transfers_in = create_Gw_transfers_in_table('Forward')
-#managers_Gw_transfers_in = create_Gw_transfers_table('Manager')
    
    
 #3 === FETCH DATA AND PREPARE TEAM DATA ===
-# Fetch data from FPL API
+# ✅ FIXED: Use safe fetch function for teams data
 teams_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
 fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
 
-teams_data = requests.get(teams_url).json()['teams']
-fixtures_data = requests.get(fixtures_url).json()
+print("\nFetching team stats data...")
+teams_bootstrap = fetch_fpl_data(teams_url)
+fixtures_data_full = fetch_fpl_data(fixtures_url)
+
+if teams_bootstrap is None or fixtures_data_full is None:
+    print("⚠️  Warning: Could not fetch team/fixtures data. Using minimal team info.")
+    teams_data = data['teams']  # Use from earlier fetch
+    fixtures_data_full = []
+else:
+    teams_data = teams_bootstrap['teams']
 
 # Process team data into DataFrame with short names
 teams_df = pd.DataFrame(teams_data)
@@ -419,15 +458,20 @@ teams_df['Last 5 GW Results'] = ""
 team_results = {team_id: [] for team_id in teams_df['id']}
 
 # Process fixtures to gather results and calculate goals
-for fixture in fixtures_data:
-    if fixture['finished'] is False:  # Skip unfinished fixtures
+for fixture in fixtures_data_full:
+    if fixture.get('finished') is False:  # Skip unfinished fixtures
         continue
 
-    home_team_id = fixture['team_h']
-    away_team_id = fixture['team_a']
+    home_team_id = fixture.get('team_h')
+    away_team_id = fixture.get('team_a')
+    home_goals = fixture.get('team_h_score')
+    away_goals = fixture.get('team_a_score')
 
-    home_goals = fixture['team_h_score'] if fixture['team_h_score'] is not None else 0
-    away_goals = fixture['team_a_score'] if fixture['team_a_score'] is not None else 0
+    if home_team_id is None or away_team_id is None:
+        continue
+
+    home_goals = home_goals if home_goals is not None else 0
+    away_goals = away_goals if away_goals is not None else 0
 
     # Increment goals and games played
     teams_df.loc[teams_df['id'] == home_team_id, 'Goals Scored'] += home_goals
@@ -452,10 +496,6 @@ for fixture in fixtures_data:
 teams_df['Last 5 GW Results'] = teams_df['id'].apply(lambda tid: ', '.join(team_results[tid][-5:]))
 
 # Calculate additional metrics
-#teams_df['Goals Scored/Game'] = (teams_df['Goals Scored'] / teams_df['Games'].replace(0, pd.NA)).round(1)
-#teams_df['Goals Conceded/Game'] = (teams_df['Goals Conceded'] / teams_df['Games'].replace(0, pd.NA)).round(1)
-#teams_df['Goal Difference'] = teams_df['Goals Scored'] - teams_df['Goals Conceded']
-
 teams_df['Goals Scored/Game'] = (
     teams_df['Goals Scored'] / teams_df['Games'].replace(0, np.nan)
 ).round(1)
@@ -516,26 +556,32 @@ status_code_info = [
    
     ["Delta GI (Goal Involvements - [xG + xA])",
      "Shows actual impact vs expected contribution",
-     "Identify players who consistently outperform stats(positive XG are performing more than expected while negative XG are performing below expectation)"]
+     "Identify players who consistently outperform stats(positive XG are performing more than expected while negative XG are performing below expectation)"],
+    
+    ["xP (Expected Points - ML Prediction)",
+     "Machine learning prediction of points for next gameweek",
+     "Use to identify high-value picks based on form, fixtures, and historical patterns"]
 ]
 # Convert the list of lists to a DataFrame
 status_code_df = pd.DataFrame(status_code_info)
 
 status_code_df['Last Updated'] = pd.to_datetime('now')
-# === PREPARE SPLIT DATAFRAMES FOR PLAYER DATA ===
 
 # === WRITE ALL DATA TO SEPARATE SHEETS ===
-# Write Player Data table to its sheet
+print("\nWriting data to Google Sheets...")
 write_to_sheet(sheet, player_df, 'Player Data')
-
-# Write Transfer Picks (for each position) to their respective sheets
 write_to_sheet(sheet, goalkeepers_Gw_transfers_in.head(5), 'Smart Picks - Goalkeepers')
 write_to_sheet(sheet, defenders_Gw_transfers_in.head(10), 'Smart Picks - Defenders')
 write_to_sheet(sheet, midfielders_Gw_transfers_in.head(15), 'Smart Picks - Midfielders')
 write_to_sheet(sheet, forwards_Gw_transfers_in.head(5), 'Smart Picks - Forwards')
-#write_to_sheet(sheet, managers_Gw_transfers_in.head(20), 'Smart Picks - Managers')
-# Write Best Attacking and Defensive Teams to their respective sheets
 write_to_sheet(sheet, attacking_teams, 'Best Attacking Teams')
 write_to_sheet(sheet, defensive_teams, 'Best Defensive Teams')
-
 write_to_sheet(sheet, status_code_df, 'FPL Key Metrics Guide')
+
+print("\n" + "="*70)
+print("✅ FPL DATA PIPELINE COMPLETED SUCCESSFULLY!")
+print("="*70)
+print(f"📊 Total players processed: {len(player_df)}")
+print(f"🤖 ML predictions: {'Active' if 'xP' in player_df.columns else 'Failed (using fallback)'}")
+print(f"📈 Data uploaded to: https://docs.google.com/spreadsheets/d/{sheet_id}")
+print("="*70)
