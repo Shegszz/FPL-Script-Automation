@@ -1,6 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[codz]
+*.py[cod]
 *$py.class
 
 # C extensions
@@ -80,16 +80,8 @@ target/
 profile_default/
 ipython_config.py
 
-# pipenv / poetry / pdm / pixi lock files
-# (these can be ignored if you want portable projects)
-#Pipfile.lock
-#poetry.lock
-#pdm.lock
-#pixi.lock
-
 # Environments
 .env
-.envrc
 .venv
 env/
 venv/
@@ -97,9 +89,11 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder / Rope project settings
-.spyderproject
+# Spyder project settings
 .spyproject
+.spyderproject
+
+# Rope project settings
 .ropeproject
 
 # mkdocs documentation
@@ -112,24 +106,65 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# pytype static type analyzer
 .pytype/
 
 # Cython debug symbols
 cython_debug/
 
-# IDE / editor stuff
+# IDE / Editor
 .idea/
 .vscode/
-.ruff_cache/
-.pypirc
-.cursorignore
-.cursorindexingignore
+*.swp
+*.swo
+*~
+.DS_Store
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# ============================================================================
+# FPL PROJECT SPECIFIC - CRITICAL SECTION
+# ============================================================================
 
-# EXTRA – Important for your project
-# Ignore service account keys (never push secrets!)
-*.json
+# ML Model Files (generated locally, too large for Git)
+fpl_model.pkl
+fpl_model_v2.pkl
+*.pkl
+
+# Local credentials (NEVER COMMIT THESE!)
+# Only ignore if you create local JSON files for testing
+# GitHub Actions uses environment variables, so this is safe
+credentials.json
+service-account-key.json
+google-credentials*.json
+
+# Local test data
+test_data/
+*.csv
+*.xlsx
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+
+# ============================================================================
+# END OF .gitignore
