@@ -10,8 +10,8 @@ import numpy as np
 from google.oauth2.service_account import Credentials
 import time
 
-# ⭐ CHANGE #1: Import ML module
-from fpl_ml_model import add_ml_predictions
+# ⭐ PRODUCTION MODEL IMPORT
+from fpl_ml_model_v2 import add_ml_predictions_v2
 
 # Load service account info from env var
 creds_json = os.getenv("GOOGLE_CREDENTIALS")
@@ -33,31 +33,27 @@ sheet = client.open_by_key(sheet_id)
 
 # === FUNCTION TO WRITE DATA TO SEPARATE SHEETS ===
 def write_to_sheet(sheet, df, sheet_name):
-    # Create or open the sheet
     try:
         worksheet = sheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
+        worksheet = sheet.add_worksheet(title=sheet_name, rows="1000", cols="30")
    
-    worksheet.clear()  # Clear previous content
+    worksheet.clear()
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
     worksheet.freeze(rows=1, cols=2)
 
 # ✅ HELPER FUNCTION: Safe API call with retry logic
 def fetch_fpl_data(url, max_retries=3):
-    """
-    Fetch data from FPL API with error handling and retries
-    """
+    """Fetch data from FPL API with error handling and retries"""
     for attempt in range(max_retries):
         try:
             response = requests.get(url, timeout=10)
-            response.raise_for_status()  # Raise error for bad status codes
+            response.raise_for_status()
             return response.json()
         except requests.exceptions.JSONDecodeError as e:
             print(f"⚠️  JSON decode error on attempt {attempt + 1}: {e}")
-            print(f"   Response text: {response.text[:200]}")
             if attempt < max_retries - 1:
-                time.sleep(2)  # Wait before retry
+                time.sleep(2)
                 continue
             else:
                 print(f"❌ Failed after {max_retries} attempts")
@@ -84,9 +80,12 @@ if data is None:
 
 # Extract player data
 players = data['elements']
-teams = {team['id']: team['short_name'] for team in data['teams']}  # Use short names for teams
+teams = {team['id']: team['short_name'] for team in data['teams']}
 positions = {position['id']: position['singular_name'] for position in data['element_types']}
 events = data['events']
+
+# Store teams data for ML model
+teams_data = data['teams']
 
 # Current Gameweek
 current_gameweek = None
@@ -94,13 +93,11 @@ for event in events:
     if event['is_current']:
         current_gameweek = event['id']
 
-# === EDIT START ===
 # Use actual GW names for next 5 gameweeks
 next_5_gameweeks = [e for e in events if e['id'] > current_gameweek][:5]
 next_5_gameweeks = [{'id': gw['id'], 'name': gw['name']} for gw in next_5_gameweeks]
-# === EDIT END ===
 
-# ✅ FIXED: Fetch fixture data with error handling
+# Fetch fixture data
 fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
 print("Fetching fixtures data...")
 fixtures = fetch_fpl_data(fixtures_url)
@@ -108,6 +105,9 @@ fixtures = fetch_fpl_data(fixtures_url)
 if fixtures is None:
     print("⚠️  Warning: Could not fetch fixtures. Continuing with empty fixtures.")
     fixtures = []
+
+# Store fixtures for ML model
+fixtures_data = fixtures
 
 # Create dictionary to store the opponents and difficulty scores for each team's Gameweek
 team_opponents = {
@@ -283,22 +283,27 @@ for player in players:
 player_df = pd.DataFrame(player_info)
 
 
-# ⭐⭐⭐ CHANGE #2: ML PREDICTION SECTION - START ⭐⭐⭐
+# ⭐⭐⭐ PRODUCTION ML MODEL - START ⭐⭐⭐
 # =============================================================================
-# ML PREDICTION - ADD xP (Expected Points)
+# PRODUCTION ML PREDICTION - Position-Specific Ensemble Models
 # =============================================================================
 try:
     print("\n" + "="*70)
-    print("🤖 MACHINE LEARNING PREDICTIONS")
+    print("🤖 PRODUCTION MACHINE LEARNING PREDICTIONS")
     print("="*70)
     
-    # Set retrain=True to retrain model, False to use cached
-    # Retrain once per week, use cached for daily updates
-    retrain_model = False  # Change to True to retrain
+    # Set retrain=True to retrain models (weekly)
+    # Set retrain=False to use cached models (daily)
+    retrain_model = False
     
-    player_df, ml_model = add_ml_predictions(player_df, retrain=retrain_model)
+    player_df, ml_model = add_ml_predictions_v2(
+        player_df, 
+        teams_data, 
+        fixtures_data, 
+        retrain=retrain_model
+    )
     
-    print(f"✅ ML predictions added to player_df")
+    print(f"✅ Production ML predictions added to player_df")
     print(f"   New columns: xP, xP_confidence, AI_Rating")
     
 except Exception as e:
@@ -314,8 +319,7 @@ except Exception as e:
 # =============================================================================
 
 
-# === EDIT START ===
-# Normalize dynamic Gameweek columns into stable Next GW Opponent i and Next GW Difficulty i columns
+# Normalize dynamic Gameweek columns
 difficulty_cols = [col for col in player_df.columns if re.match(r'Gameweek\s+\d+\s+Difficulty$', col)]
 opponent_cols = [col for col in player_df.columns if re.match(r'Gameweek\s+\d+$', col)]
 
@@ -349,19 +353,18 @@ player_df['Next 5 GW FDR'] = player_df.apply(
     axis=1
 )
 player_df['Next GW Opponent'] = player_df['Next GW Opponent 1']
-# === EDIT END ===
 
 pd.set_option('display.max.columns', 75)
-#2 Helper function to safely parse Difficulty values
+
+# Helper function to safely parse Difficulty values
 def parse_difficulty(val):
     if isinstance(val, list):
         return sum(val)
     elif isinstance(val, str):
-        # Split by comma and convert to float
         try:
             return sum(float(x.strip()) for x in val.split(',') if x.strip() != '')
         except ValueError:
-            return 0  # Handle malformed values gracefully
+            return 0
     elif isinstance(val, (int, float)):
         return float(val)
     return 0
@@ -374,49 +377,46 @@ player_df['Difficulty Score'] = player_df.apply(
     ), axis=1
 )
 
-# FD Index calculation (for the next N gameweeks)
-# Avoid division by zero
+# FD Index calculation
 player_df['FD Index'] = player_df.apply(
     lambda r: round(float(r['Form']) / r['Difficulty Score'], 2) if r['Difficulty Score'] not in (0, np.nan) else np.nan,
     axis=1
 )
 
-# Next GW Difficulty: parse the first upcoming GW difficulty (handles double fixtures in string)
+# Next GW Difficulty: parse the first upcoming GW difficulty
 player_df['Next GW Difficulty'] = player_df['Next GW Difficulty'].apply(parse_difficulty)
 
-# Ensure Next 5 GW FDR list is numeric (parsed)
+# Ensure Next 5 GW FDR list is numeric
 player_df['Next 5 GW FDR'] = player_df['Next 5 GW FDR'].apply(
     lambda lst: [parse_difficulty(x) for x in lst]
 )
 
-# Add columns for the next N opponents using the normalized names (already present as Next GW Opponent i)
 for i in range(1, max_next + 1):
     player_df[f'Next GW Opponent {i}'] = player_df.get(f'Next GW Opponent {i}', '')
 
-# ⭐⭐⭐ CHANGE #3: Update table function to include xP columns - START ⭐⭐⭐
-# Table creation function — updated to reference normalized Next GW columns instead of gw["name"]
+# ⭐ Table creation function with xP columns
 def create_Gw_transfers_in_table(position_name):
-    # base columns (kept exactly as your original intent)
     base_cols = [
         'Player Name','Availability', 'Team', 'Position', 'Cost', 
-        'xP', 'xP_confidence', 'AI_Rating',  # ⭐ ADDED ML COLUMNS
-        'Form', 'FD Index', 'XG', 'Clean Sheets', 'Saves', 'Starts', 'Minutes', 'Yellow Cards', 'Red Cards', 'Defensive Contributions', 'Defensive Contributions/90', 'Goals', 'Assists',
-        'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Points/Game',
-        'Expected points Next GW', 'Total Points', 'Difficulty Score', 'Total Bonus Point', 'Current Gameweek'
+        'xP', 'xP_confidence', 'AI_Rating',  # ML COLUMNS
+        'Form', 'FD Index', 'XG', 'Clean Sheets', 'Saves', 'Starts', 'Minutes', 
+        'Yellow Cards', 'Red Cards', 'Defensive Contributions', 'Defensive Contributions/90', 
+        'Goals', 'Assists', 'XG Current GW','XG Previous GW', 'ΔG_GW', 'Delta G', 
+        'XA', 'Delta GI', 'XG/90', 'Ownership (%)', 'GW Points', 'Points/Game',
+        'Expected points Next GW', 'Total Points', 'Difficulty Score', 
+        'Total Bonus Point', 'Current Gameweek'
     ]
-    # add normalized Next GW Opponent and Difficulty columns
+    
     next_gw_cols = []
     for i in range(1, max_next + 1):
         next_gw_cols.append(f'Next GW Opponent {i}')
         next_gw_cols.append(f'Next GW Difficulty {i}')
-    # final columns
+    
     final_cols = base_cols + next_gw_cols + ['GW Transfers In', 'GW Transfers Out']
-    # filter by position and select available columns
+    
     df = player_df[player_df['Position'] == position_name]
-    # ensure only existing columns are selected (in case of schema differences)
     selected_cols = [c for c in final_cols if c in df.columns]
     return df[selected_cols].sort_values(by='GW Transfers In', ascending=False)
-# ⭐⭐⭐ CHANGE #3: END ⭐⭐⭐
 
 
 # Create transfer pick tables for each position
@@ -424,10 +424,9 @@ goalkeepers_Gw_transfers_in = create_Gw_transfers_in_table('Goalkeeper')
 defenders_Gw_transfers_in = create_Gw_transfers_in_table('Defender')
 midfielders_Gw_transfers_in = create_Gw_transfers_in_table('Midfielder')
 forwards_Gw_transfers_in = create_Gw_transfers_in_table('Forward')
-   
+
    
 #3 === FETCH DATA AND PREPARE TEAM DATA ===
-# ✅ FIXED: Use safe fetch function for teams data
 teams_url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
 fixtures_url = 'https://fantasy.premierleague.com/api/fixtures/'
 
@@ -437,16 +436,15 @@ fixtures_data_full = fetch_fpl_data(fixtures_url)
 
 if teams_bootstrap is None or fixtures_data_full is None:
     print("⚠️  Warning: Could not fetch team/fixtures data. Using minimal team info.")
-    teams_data = data['teams']  # Use from earlier fetch
+    teams_data_df = data['teams']
     fixtures_data_full = []
 else:
-    teams_data = teams_bootstrap['teams']
+    teams_data_df = teams_bootstrap['teams']
 
-# Process team data into DataFrame with short names
-teams_df = pd.DataFrame(teams_data)
+# Process team data into DataFrame
+teams_df = pd.DataFrame(teams_data_df)
 teams_df = teams_df[['id', 'short_name', 'name', 'played', 'points', 'form']]
-teams_df.rename(columns={'short_name': 'team'}, inplace=True)
-teams_df.rename(columns={'name': 'Team'}, inplace=True)
+teams_df.rename(columns={'short_name': 'team', 'name': 'Team'}, inplace=True)
 
 # Initialize columns for goals and games
 teams_df['Goals Scored'] = 0
@@ -459,7 +457,7 @@ team_results = {team_id: [] for team_id in teams_df['id']}
 
 # Process fixtures to gather results and calculate goals
 for fixture in fixtures_data_full:
-    if fixture.get('finished') is False:  # Skip unfinished fixtures
+    if fixture.get('finished') is False:
         continue
 
     home_team_id = fixture.get('team_h')
@@ -473,7 +471,6 @@ for fixture in fixtures_data_full:
     home_goals = home_goals if home_goals is not None else 0
     away_goals = away_goals if away_goals is not None else 0
 
-    # Increment goals and games played
     teams_df.loc[teams_df['id'] == home_team_id, 'Goals Scored'] += home_goals
     teams_df.loc[teams_df['id'] == home_team_id, 'Goals Conceded'] += away_goals
     teams_df.loc[teams_df['id'] == away_team_id, 'Goals Scored'] += away_goals
@@ -482,20 +479,16 @@ for fixture in fixtures_data_full:
     teams_df.loc[teams_df['id'] == home_team_id, 'Games'] += 1
     teams_df.loc[teams_df['id'] == away_team_id, 'Games'] += 1
 
-    # Capture result string
     home_team_name = teams_df.loc[teams_df['id'] == home_team_id, 'team'].values[0]
     away_team_name = teams_df.loc[teams_df['id'] == away_team_id, 'team'].values[0]
 
     result = f"{home_team_name} {home_goals} - {away_goals} {away_team_name}"
 
-    # Append result to each team's history
     team_results[home_team_id].append(result)
     team_results[away_team_id].append(result)
 
-# Assign only the last 5 results to the teams_df
 teams_df['Last 5 GW Results'] = teams_df['id'].apply(lambda tid: ', '.join(team_results[tid][-5:]))
 
-# Calculate additional metrics
 teams_df['Goals Scored/Game'] = (
     teams_df['Goals Scored'] / teams_df['Games'].replace(0, np.nan)
 ).round(1)
@@ -510,19 +503,16 @@ teams_df['Goal Difference'] = teams_df['Goals Scored'] - teams_df['Goals Concede
 attacking_teams = teams_df.sort_values(by=['Goals Scored/Game', 'Goals Scored', 'Goal Difference'], ascending=[False, False, False])[[
     'Team', 'Games', 'Goals Scored/Game', 'Goals Conceded/Game', 'Goals Scored',
     'Goals Conceded', 'Goal Difference', 'Last 5 GW Results'
-]].rename(columns={
-    'team': 'Team'
-})
+]]
 attacking_teams['Last Updated'] = pd.to_datetime('now')
+
 defensive_teams = teams_df.sort_values(by=['Goals Conceded/Game', 'Goals Conceded'], ascending=[True, True])[[  
     'Team', 'Games', 'Goals Conceded/Game', 'Goals Conceded', 'Goals Scored/Game',
     'Goals Scored', 'Goal Difference', 'Last 5 GW Results'
-]].rename(columns={
-    'team': 'Team'
-})
+]]
 defensive_teams['Last Updated'] = pd.to_datetime('now')
 
-# Create the status code message as a list of lists (each sublist is a row)
+# Create the status code info
 status_code_info = [
     ["Status Code", "Meaning / Implication for FPL"],
     ["'a'", "Available – Fit to play, no restrictions"],
@@ -550,21 +540,28 @@ status_code_info = [
      "Gauges assist potential from creative passing",
      "Pick players with high assist potential"],
    
-    ["ΔG_gw (Also Delta G/gameweek = Current GW XG - Previous GW XG)",
+    ["ΔG_gw (Delta G/gameweek = Current GW XG - Previous GW XG)",
      "How much a player's involvement in expected goals has changed from last week to this week",
-     "Helps you track a player's weekly attacking momentum(+ve ΔG_gw means this week's in-form players while -ve ΔG_gw are perfoming less than the previous week)"],
+     "Track weekly attacking momentum (+ve = in-form, -ve = declining)"],
    
     ["Delta GI (Goal Involvements - [xG + xA])",
      "Shows actual impact vs expected contribution",
-     "Identify players who consistently outperform stats(positive XG are performing more than expected while negative XG are performing below expectation)"],
+     "Identify players outperforming stats (+ve = exceeding expectations)"],
     
     ["xP (Expected Points - ML Prediction)",
-     "Machine learning prediction of points for next gameweek",
-     "Use to identify high-value picks based on form, fixtures, and historical patterns"]
+     "AI prediction of next gameweek points using 20 GW history",
+     "Production model with position-specific algorithms and opponent analysis"],
+    
+    ["xP_confidence",
+     "Uncertainty range for xP prediction",
+     "Lower = more confident. High variance players have higher values"],
+    
+    ["AI_Rating",
+     "Premium/Good/Medium/Avoid based on xP",
+     "Quick visual indicator for transfer decisions"]
 ]
-# Convert the list of lists to a DataFrame
-status_code_df = pd.DataFrame(status_code_info)
 
+status_code_df = pd.DataFrame(status_code_info)
 status_code_df['Last Updated'] = pd.to_datetime('now')
 
 # === WRITE ALL DATA TO SEPARATE SHEETS ===
@@ -582,6 +579,6 @@ print("\n" + "="*70)
 print("✅ FPL DATA PIPELINE COMPLETED SUCCESSFULLY!")
 print("="*70)
 print(f"📊 Total players processed: {len(player_df)}")
-print(f"🤖 ML predictions: {'Active' if 'xP' in player_df.columns else 'Failed (using fallback)'}")
+print(f"🤖 ML predictions: {'Active (Production Model)' if 'xP' in player_df.columns else 'Failed (using fallback)'}")
 print(f"📈 Data uploaded to: https://docs.google.com/spreadsheets/d/{sheet_id}")
 print("="*70)
