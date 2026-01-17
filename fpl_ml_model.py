@@ -703,7 +703,7 @@ class AdvancedFPLPredictor:
             return False
 
 
-def add_ml_predictions_v2(player_df, teams_data, fixtures_data, retrain=False):
+def add_ml_predictions(player_df, teams_data, fixtures_data, retrain=False):
     """
     Main function to add production ML predictions
     
@@ -718,7 +718,7 @@ def add_ml_predictions_v2(player_df, teams_data, fixtures_data, retrain=False):
         model: The trained model object
     """
     model = AdvancedFPLPredictor()
-    model_path = 'fpl_model_v2.pkl'
+    model_path = 'fpl_model.pkl'
     
     # Try to load existing model
     if not retrain and os.path.exists(model_path):
