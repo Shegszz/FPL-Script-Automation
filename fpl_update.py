@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 import time
 
 # ⭐ PRODUCTION MODEL IMPORT
-from fpl_ml_model_v2 import add_ml_predictions_v2
+from fpl_ml_model import add_ml_predictions
 
 # Load service account info from env var
 creds_json = os.getenv("GOOGLE_CREDENTIALS")
