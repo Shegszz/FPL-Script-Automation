@@ -6,8 +6,16 @@ This system automates data collection, predicts performance,
 and recommends optimal decisions.
 
 ## Architecture
-[Include diagram showing: API → Python ETL → Google Sheets → 
-Tableau → Alert System → ML Model → Predictions]
+```mermaid
+flowchart LR
+    A[🌐 FPL API] -->|Raw JSON| B[🐍 Python ETL]
+    B -->|Cleaned Data| C[📊 Google Sheets]
+    C -->|Auto-refresh| D[📈 Tableau Dashboard]
+    C -->|Trigger| E[🔔 Alert System]
+    B -->|Feature Engineering| F[🤖 ML Model\nXGBoost]
+    F -->|xP Scores| G[🎯 Predictions]
+    E -->|Gameweek Alerts| G
+```
 
 ## Features
 1. Automated daily data pipeline (FPL API → Google Sheets)
