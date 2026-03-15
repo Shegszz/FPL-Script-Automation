@@ -42,7 +42,7 @@ def write_to_sheet(sheet, df, sheet_name):
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
     worksheet.freeze(rows=1, cols=2)
 
-# ✅ HELPER FUNCTION: Safe API call with retry logic
+# ✅ HELPER FUNCTION: Safe API call
 def fetch_fpl_data(url, max_retries=3):
     """Fetch data from FPL API with error handling and retries"""
     for attempt in range(max_retries):
@@ -93,7 +93,7 @@ for event in events:
     if event['is_current']:
         current_gameweek = event['id']
 
-# Use actual GW names for next 5 gameweeks
+# GW for next 5 gameweeks
 next_5_gameweeks = [e for e in events if e['id'] > current_gameweek][:5]
 next_5_gameweeks = [{'id': gw['id'], 'name': gw['name']} for gw in next_5_gameweeks]
 
@@ -283,7 +283,7 @@ for player in players:
 player_df = pd.DataFrame(player_info)
 
 
-# ⭐⭐⭐ PRODUCTION ML MODEL - START ⭐⭐⭐
+# ⭐⭐⭐ PRODUCTION ML MODEL  ⭐⭐⭐
 # =============================================================================
 # PRODUCTION ML PREDICTION - Position-Specific Ensemble Models
 # =============================================================================
@@ -313,10 +313,6 @@ except Exception as e:
     player_df['xP'] = player_df['Form'].astype(float)
     player_df['xP_confidence'] = 0
     player_df['AI_Rating'] = 'N/A'
-
-# =============================================================================
-# END OF ML SECTION
-# =============================================================================
 
 
 # Normalize dynamic Gameweek columns
