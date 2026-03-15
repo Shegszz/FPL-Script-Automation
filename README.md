@@ -1,10 +1,10 @@
-# FPL Analytics Engine: Automated Player Intelligence System
+# Automated FPL Analytics Pipeline — End-to-End Data Engineering Project 
 
 ## Problem
 8M+ FPL managers make 40M+ transfers weekly with limited data.
-This system automates data collection, predicts performance, 
-and recommends optimal decisions.
-
+I built a fully automated data pipeline for Fantasy Premier League analytics. Python ingests live data from the FPL API, transforms it with Pandas, writes to Google sheets, and GitHub Actions runs the entire workflow on a daily schedule — no manual steps, no intervention needed. The dashboard updates itself.
+This project demonstrates the core loop I build professionally: API ingestion → automated transformation → self-updating output.
+Stack: Python · Pandas · FPL API · GitHub Actions · ETL · Google sheets 
 ## Architecture
 ```mermaid
 flowchart LR
