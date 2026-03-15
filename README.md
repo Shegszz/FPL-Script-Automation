@@ -11,7 +11,6 @@ flowchart LR
     A[🌐 FPL API] -->|Raw JSON| B[🐍 Python ETL]
     B -->|Cleaned Data| C[📊 Google Sheets]
     C -->|Auto-refresh| D[📈 Tableau Dashboard]
-    C -->|Trigger| E[🔔 Alert System]
     B -->|Feature Engineering| F[🤖 ML Model\nXGBoost]
     F -->|xP Scores| G[🎯 Predictions]
     E -->|Gameweek Alerts| G
