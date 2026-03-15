@@ -38,4 +38,4 @@ Python | Pandas | Scikit-learn | XGBoost | FPL API |
 Google Sheets API | Tableau | Google Apps Script
 
 ## 📸 Demo
-[Screenshots + Video walkthrough]
+Screenshots + Video walkthrough soon...
