@@ -6,16 +6,22 @@
 # Pipeline:
 #   FPL API → Python ETL → Google Sheets (auto-refreshed daily via GitHub Actions)
 #
-# Sheets written:
-#   - Player Data              (all players, all metrics + ML predictions)
+# Sheets written (General — all viewers):
+#   - Player Data
 #   - Smart Picks - Goalkeepers
 #   - Smart Picks - Defenders
 #   - Smart Picks - Midfielders
 #   - Smart Picks - Forwards
 #   - Best Attacking Teams
 #   - Best Defensive Teams
-#   - Rank & Gameweek History  (for dashboard rank trajectory chart)
+#   - Fixture Planner          ← NEW: FDR heatmap, DGW/BGW, avg FDR next 8 GWs
 #   - FPL Key Metrics Guide
+#
+# Sheets written (Personal — My Season page):
+#   - My FPL - Season History  ← UPDATED: KPI deltas, rank arrows, xP vs actual
+#   - My FPL - Current Squad   ← UPDATED: free transfer logic, xP vs actual
+#   - My FPL - Transfers
+#   - My FPL - KPI Summary     ← NEW: single-row KPI card feed for dashboard
 # =============================================================================
 
 import os
@@ -59,6 +65,42 @@ if not sheet_id:
 sheet = client.open_by_key(sheet_id)
 
 # ---------------------------------------------------------------------------
+# MY FPL TEAM ID
+# Reads from GitHub Actions secret first.
+# Falls back to default (your public FPL Team ID) for local runs.
+# FPL Team IDs are publicly visible on the FPL website — not sensitive.
+# ---------------------------------------------------------------------------
+
+MY_TEAM_ID = os.getenv("FPL_TEAM_ID", "2551369")
+
+# ---------------------------------------------------------------------------
+# FDR COLOUR MAPPING
+# Exact FPL official colour codes (hex) per difficulty rating.
+# DGW = Double Gameweek (team plays twice — gold opportunity).
+# BGW = Blank Gameweek (team doesn't play — avoid before it hits).
+# ---------------------------------------------------------------------------
+
+FDR_COLOURS = {
+    1: '#375523',   # FPL dark green  — very easy
+    2: '#01FC7A',   # FPL bright green — easy
+    3: '#E7E7E7',   # FPL light grey  — medium
+    4: '#FF1751',   # FPL red         — hard
+    5: '#80072D',   # FPL dark red    — very hard
+    'DGW': '#DAA520',  # Gold  — double gameweek (custom, not FPL)
+    'BGW': '#4A4A4A',  # Dark grey — blank gameweek (custom)
+}
+
+FDR_LABELS = {
+    1: '1 — Very Easy',
+    2: '2 — Easy',
+    3: '3 — Medium',
+    4: '4 — Hard',
+    5: '5 — Very Hard',
+    'DGW': 'DGW ⚡',
+    'BGW': 'BGW —',
+}
+
+# ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 
@@ -67,7 +109,7 @@ def write_to_sheet(sheet, df: pd.DataFrame, sheet_name: str) -> None:
     try:
         worksheet = sheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(title=sheet_name, rows="2000", cols="50")
+        worksheet = sheet.add_worksheet(title=sheet_name, rows="2000", cols="60")
 
     worksheet.clear()
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
@@ -108,7 +150,7 @@ def parse_difficulty(val) -> float:
             return sum(float(x.strip()) for x in val.split(',') if x.strip())
         except ValueError:
             return 0.0
-    if isinstance(val, (int, float)) and not np.isnan(val):
+    if isinstance(val, (int, float)) and not np.isnan(float(val)):
         return float(val)
     return 0.0
 
@@ -117,6 +159,24 @@ def gw_col_number(colname: str) -> int:
     """Extract integer from 'Gameweek N' column name for sorting."""
     m = re.search(r'Gameweek\s+(\d+)', colname)
     return int(m.group(1)) if m else 0
+
+
+def fdr_label(fdr_val: int, is_dgw: bool = False, is_bgw: bool = False) -> str:
+    """Return display label for a fixture cell including DGW/BGW flags."""
+    if is_bgw:
+        return 'BGW —'
+    if is_dgw:
+        return 'DGW ⚡'
+    return str(fdr_val) if fdr_val else '—'
+
+
+def fdr_hex(fdr_val, is_dgw: bool = False, is_bgw: bool = False) -> str:
+    """Return the FPL-official hex colour for a difficulty rating."""
+    if is_bgw:
+        return FDR_COLOURS['BGW']
+    if is_dgw:
+        return FDR_COLOURS['DGW']
+    return FDR_COLOURS.get(int(fdr_val), '#E7E7E7')
 
 # ---------------------------------------------------------------------------
 # 1. BOOTSTRAP DATA
@@ -132,14 +192,16 @@ data = fetch_fpl_data(fpl_url)
 if data is None:
     raise RuntimeError("Failed to fetch bootstrap-static. Pipeline aborted.")
 
-players_raw  = data['elements']
-teams        = {team['id']: team['short_name'] for team in data['teams']}
-positions    = {pos['id']: pos['singular_name'] for pos in data['element_types']}
-events       = data['events']
-teams_data   = data['teams']   # Full team list — passed to ML model
+players_raw = data['elements']
+teams       = {team['id']: team['short_name'] for team in data['teams']}
+positions   = {pos['id']: pos['singular_name'] for pos in data['element_types']}
+events      = data['events']
+teams_data  = data['teams']   # Full team list — passed to ML model
 
 # ---------------------------------------------------------------------------
-# 2. CURRENT GAMEWEEK + NEXT 5
+# 2. CURRENT GAMEWEEK + NEXT 8
+# Extended from next 5 to next 8 to support the FDR heatmap (8 GW lookahead).
+# The player data columns still use next 5 only (bandwidth / sheet size).
 # ---------------------------------------------------------------------------
 
 current_gameweek = next(
@@ -148,19 +210,40 @@ current_gameweek = next(
 )
 
 if current_gameweek is None:
-    # Fallback: use last finished GW
     current_gameweek = max(e['id'] for e in events if e.get('finished'))
 
 print(f"   ✅ Current Gameweek: {current_gameweek}")
 
+# Next 5 GWs — for player columns in Player Data sheet
 next_5_gameweeks = [
     {'id': e['id'], 'name': e['name']}
     for e in events
     if e['id'] > current_gameweek
 ][:5]
 
+# Next 8 GWs — for FDR heatmap in Fixture Planner sheet
+next_8_gameweeks = [
+    {'id': e['id'], 'name': e['name']}
+    for e in events
+    if e['id'] > current_gameweek
+][:8]
+
+# GW average points lookup — used for xP vs Average comparisons
+gw_averages = {e['id']: e.get('average_entry_score', 0) for e in events}
+
+# GW highest scores — used for Team of the Week comparison
+gw_highest  = {e['id']: e.get('highest_score', 0) for e in events}
+
+print(f"   ✅ Next 5 GWs: {[g['name'] for g in next_5_gameweeks]}")
+print(f"   ✅ Next 8 GWs: {[g['name'] for g in next_8_gameweeks]}")
+
 # ---------------------------------------------------------------------------
 # 3. FIXTURES
+# Builds TWO lookups:
+#   team_opponents     → next 5 GWs (for Player Data columns)
+#   team_opponents_8gw → next 8 GWs (for Fixture Planner heatmap)
+# Also detects Double Gameweeks (team appears twice in one GW)
+# and Blank Gameweeks (team has no fixture in a GW).
 # ---------------------------------------------------------------------------
 
 print("\n📡 Fetching fixtures...")
@@ -171,7 +254,10 @@ if fixtures is None:
 
 fixtures_data = fixtures   # Passed to ML model
 
-# Build team → GW → opponent/difficulty lookup (supports double gameweeks)
+next_5_ids = {gw['id'] for gw in next_5_gameweeks}
+next_8_ids = {gw['id'] for gw in next_8_gameweeks}
+
+# 5-GW lookup (player data columns)
 team_opponents = {
     team_id: {
         gw['id']: {'opponent': [], 'difficulty': [], 'home_away': []}
@@ -180,29 +266,55 @@ team_opponents = {
     for team_id in teams.keys()
 }
 
-next_5_ids = {gw['id'] for gw in next_5_gameweeks}
+# 8-GW lookup (fixture planner heatmap)
+team_opponents_8gw = {
+    team_id: {
+        gw['id']: {'opponent': [], 'difficulty': [], 'home_away': [], 'fixture_count': 0}
+        for gw in next_8_gameweeks
+    }
+    for team_id in teams.keys()
+}
 
 for fixture in fixtures:
-    event_id      = fixture.get('event')
-    home_team_id  = fixture.get('team_h')
-    away_team_id  = fixture.get('team_a')
-    home_diff     = fixture.get('team_h_difficulty')
-    away_diff     = fixture.get('team_a_difficulty')
+    event_id     = fixture.get('event')
+    home_team_id = fixture.get('team_h')
+    away_team_id = fixture.get('team_a')
+    home_diff    = fixture.get('team_h_difficulty')
+    away_diff    = fixture.get('team_a_difficulty')
 
-    if not (event_id and home_team_id and away_team_id and event_id in next_5_ids):
+    if not (event_id and home_team_id and away_team_id):
         continue
 
-    # Home team
-    if home_team_id in team_opponents and event_id in team_opponents[home_team_id]:
-        team_opponents[home_team_id][event_id]['opponent'].append(teams[away_team_id])
-        team_opponents[home_team_id][event_id]['difficulty'].append(home_diff)
-        team_opponents[home_team_id][event_id]['home_away'].append(f"{teams[home_team_id]}(H)")
+    # 5-GW lookup
+    if event_id in next_5_ids:
+        if home_team_id in team_opponents and event_id in team_opponents[home_team_id]:
+            team_opponents[home_team_id][event_id]['opponent'].append(teams[away_team_id])
+            team_opponents[home_team_id][event_id]['difficulty'].append(home_diff)
+            team_opponents[home_team_id][event_id]['home_away'].append(f"{teams[home_team_id]}(H)")
 
-    # Away team
-    if away_team_id in team_opponents and event_id in team_opponents[away_team_id]:
-        team_opponents[away_team_id][event_id]['opponent'].append(teams[home_team_id])
-        team_opponents[away_team_id][event_id]['difficulty'].append(away_diff)
-        team_opponents[away_team_id][event_id]['home_away'].append(f"{teams[away_team_id]}(A)")
+        if away_team_id in team_opponents and event_id in team_opponents[away_team_id]:
+            team_opponents[away_team_id][event_id]['opponent'].append(teams[home_team_id])
+            team_opponents[away_team_id][event_id]['difficulty'].append(away_diff)
+            team_opponents[away_team_id][event_id]['home_away'].append(f"{teams[away_team_id]}(A)")
+
+    # 8-GW lookup
+    if event_id in next_8_ids:
+        if home_team_id in team_opponents_8gw and event_id in team_opponents_8gw[home_team_id]:
+            d = team_opponents_8gw[home_team_id][event_id]
+            d['opponent'].append(teams[away_team_id])
+            d['difficulty'].append(home_diff)
+            d['home_away'].append(f"{teams[home_team_id]}(H)")
+            d['fixture_count'] += 1
+
+        if away_team_id in team_opponents_8gw and event_id in team_opponents_8gw[away_team_id]:
+            d = team_opponents_8gw[away_team_id][event_id]
+            d['opponent'].append(teams[home_team_id])
+            d['difficulty'].append(away_diff)
+            d['home_away'].append(f"{teams[away_team_id]}(A)")
+            d['fixture_count'] += 1
+
+print(f"   ✅ Fixtures indexed: {len([f for f in fixtures if f.get('finished')])} finished, "
+      f"{len([f for f in fixtures if not f.get('finished') and f.get('event')])} upcoming")
 
 # ---------------------------------------------------------------------------
 # 4. LIVE GW DATA (xG, xGI for current and previous GW)
@@ -380,8 +492,6 @@ print("🤖 RUNNING ML PREDICTIONS")
 print("="*70)
 
 try:
-    # retrain=False → use cached model daily (fast)
-    # retrain=True  → re-fetch training data + retrain (set weekly via workflow env var)
     retrain_model = os.getenv("RETRAIN_MODEL", "false").lower() == "true"
 
     player_df, ml_model = add_ml_predictions_v2(
@@ -398,7 +508,6 @@ except Exception as e:
     print("   Falling back to Form-based xP approximation...")
     ml_success = False
 
-    # Graceful fallback — columns must exist for sheets to write cleanly
     player_df['xP']            = pd.to_numeric(player_df['Form'], errors='coerce').fillna(0)
     player_df['xP_confidence'] = 0.0
     player_df['AI_Rating']     = 'N/A'
@@ -424,14 +533,12 @@ for i, col in enumerate(opponent_cols, start=1):
 
 max_next = max(len(next_5_gameweeks), 1)
 
-# Ensure all 5 columns exist (blank if fewer than 5 GWs left in season)
 for i in range(1, 6):
     if f'Next GW Difficulty {i}' not in player_df.columns:
         player_df[f'Next GW Difficulty {i}'] = np.nan
     if f'Next GW Opponent {i}' not in player_df.columns:
         player_df[f'Next GW Opponent {i}'] = ''
 
-# Primary next GW alias
 player_df['Next GW Opponent']   = player_df['Next GW Opponent 1']
 player_df['Next GW Difficulty'] = player_df['Next GW Difficulty 1'].apply(parse_difficulty)
 
@@ -454,7 +561,6 @@ player_df['FD Index'] = player_df.apply(
     axis=1,
 )
 
-# Next 5 GW FDR as list (useful for Power BI custom visuals)
 player_df['Next 5 GW FDR'] = player_df.apply(
     lambda row: [
         parse_difficulty(row.get(f'Next GW Difficulty {i}', np.nan))
@@ -464,14 +570,111 @@ player_df['Next 5 GW FDR'] = player_df.apply(
 )
 
 # ---------------------------------------------------------------------------
-# 9. DASHBOARD-READY DERIVED COLUMNS
-# These are needed to support the Power BI dashboard visualisations.
+# 8b. FDR HEATMAP DATA
+# Builds the Fixture Planner sheet — one row per team, one col per GW (next 8).
+# Uses exact FPL colour codes for 1–5 difficulty.
+# Detects DGW (fixture_count > 1) and BGW (fixture_count == 0) automatically.
 # ---------------------------------------------------------------------------
 
-# Net transfers this GW (positive = being bought, negative = being sold)
+print("\n🔨 Building Fixture Planner (FDR heatmap)...")
+
+fixture_planner_rows = []
+
+for team_id, team_short in teams.items():
+    row = {
+        'Team':        team_short,
+        'Team ID':     team_id,
+    }
+
+    avg_fdrs     = []
+    dgw_count    = 0
+    bgw_count    = 0
+
+    for gw in next_8_gameweeks:
+        gw_id   = gw['id']
+        gw_name = gw['name']
+
+        if team_id not in team_opponents_8gw or gw_id not in team_opponents_8gw[team_id]:
+            # No fixture data — treat as BGW
+            row[f'{gw_name} Opponent']    = 'BGW'
+            row[f'{gw_name} FDR']         = 0
+            row[f'{gw_name} FDR Colour']  = FDR_COLOURS['BGW']
+            row[f'{gw_name} Type']        = 'BGW'
+            row[f'{gw_name} Display']     = 'BGW —'
+            bgw_count += 1
+            continue
+
+        gw_info = team_opponents_8gw[team_id][gw_id]
+        count   = gw_info['fixture_count']
+
+        if count == 0:
+            # BGW — no fixture scheduled
+            row[f'{gw_name} Opponent']    = 'BGW'
+            row[f'{gw_name} FDR']         = 0
+            row[f'{gw_name} FDR Colour']  = FDR_COLOURS['BGW']
+            row[f'{gw_name} Type']        = 'BGW'
+            row[f'{gw_name} Display']     = 'BGW —'
+            bgw_count += 1
+
+        elif count >= 2:
+            # DGW — two fixtures in same GW
+            # Use the average of both fixture difficulties
+            valid_diffs = [d for d in gw_info['difficulty'] if d]
+            avg_diff    = sum(valid_diffs) / len(valid_diffs) if valid_diffs else 3
+            opps        = ', '.join([
+                f"{opp}{ha[-3:]}"
+                for opp, ha in zip(gw_info['opponent'], gw_info['home_away'])
+            ])
+            row[f'{gw_name} Opponent']    = opps
+            row[f'{gw_name} FDR']         = round(avg_diff, 1)
+            row[f'{gw_name} FDR Colour']  = FDR_COLOURS['DGW']
+            row[f'{gw_name} Type']        = 'DGW'
+            row[f'{gw_name} Display']     = f'DGW ⚡ {opps}'
+            avg_fdrs.append(avg_diff)
+            dgw_count += 1
+
+        else:
+            # Normal single fixture
+            diff = gw_info['difficulty'][0] if gw_info['difficulty'] else 3
+            opp  = gw_info['opponent'][0]   if gw_info['opponent']   else '?'
+            ha   = gw_info['home_away'][0]  if gw_info['home_away']  else ''
+            display = f"{opp}{ha[-3:]}"
+
+            row[f'{gw_name} Opponent']    = display
+            row[f'{gw_name} FDR']         = int(diff)
+            row[f'{gw_name} FDR Colour']  = fdr_hex(diff)
+            row[f'{gw_name} Type']        = 'Normal'
+            row[f'{gw_name} Display']     = display
+            avg_fdrs.append(float(diff))
+
+    # Summary metrics per team
+    row['Avg FDR Next 8 GW']   = round(sum(avg_fdrs) / len(avg_fdrs), 2) if avg_fdrs else 0
+    row['Avg FDR Next 5 GW']   = round(sum(avg_fdrs[:5]) / len(avg_fdrs[:5]), 2) if avg_fdrs[:5] else 0
+    row['Avg FDR Next 3 GW']   = round(sum(avg_fdrs[:3]) / len(avg_fdrs[:3]), 2) if avg_fdrs[:3] else 0
+    row['DGW Count']            = dgw_count
+    row['BGW Count']            = bgw_count
+    row['Fixture Rating']       = (
+        'Excellent'  if row['Avg FDR Next 5 GW'] <= 2.0 else
+        'Good'       if row['Avg FDR Next 5 GW'] <= 2.8 else
+        'Average'    if row['Avg FDR Next 5 GW'] <= 3.5 else
+        'Difficult'
+    )
+    row['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
+
+    fixture_planner_rows.append(row)
+
+fixture_planner_df = pd.DataFrame(fixture_planner_rows).sort_values(
+    by='Avg FDR Next 5 GW', ascending=True
+).reset_index(drop=True)
+
+print(f"   ✅ Fixture Planner built: {len(fixture_planner_df)} teams × {len(next_8_gameweeks)} GWs")
+
+# ---------------------------------------------------------------------------
+# 9. DASHBOARD-READY DERIVED COLUMNS
+# ---------------------------------------------------------------------------
+
 player_df['Net GW Transfers'] = player_df['GW Transfers In'] - player_df['GW Transfers Out']
 
-# Price rise probability proxy (normalised net transfer direction)
 player_df['Price Rise Score'] = player_df.apply(
     lambda row: round(
         (row['GW Transfers In'] - row['GW Transfers Out']) /
@@ -481,7 +684,6 @@ player_df['Price Rise Score'] = player_df.apply(
     axis=1,
 )
 
-# Differential score: high xP + low ownership = massive rank swing potential
 player_df['Differential Score'] = player_df.apply(
     lambda row: round(
         float(row.get('xP', 0) or 0) *
@@ -491,7 +693,6 @@ player_df['Differential Score'] = player_df.apply(
     axis=1,
 )
 
-# Captaincy score: composite of xP, form, fixture
 player_df['Captaincy Score'] = player_df.apply(
     lambda row: round(
         float(row.get('xP', 0) or 0) * 0.50 +
@@ -502,7 +703,6 @@ player_df['Captaincy Score'] = player_df.apply(
     axis=1,
 )
 
-# Transfer in composite score (xP, fixture, value)
 player_df['Transfer In Score'] = player_df.apply(
     lambda row: round(
         float(row.get('xP', 0) or 0) * 0.40 +
@@ -513,7 +713,6 @@ player_df['Transfer In Score'] = player_df.apply(
     axis=1,
 )
 
-# Points per million (value metric)
 player_df['Points Per Million'] = player_df.apply(
     lambda row: round(
         float(row.get('Total Points', 0) or 0) / max(float(row.get('Cost', 4.0) or 4.0), 1.0),
@@ -522,7 +721,7 @@ player_df['Points Per Million'] = player_df.apply(
     axis=1,
 )
 
-# Double/blank GW flag (basic — checks if player has 0 opponents listed)
+# DGW / BGW flags — derived from Next GW Opponent 1 (comma = two opponents = DGW)
 player_df['Has DGW'] = player_df['Next GW Opponent 1'].apply(
     lambda x: '⚡ DGW' if (isinstance(x, str) and ',' in x) else ''
 )
@@ -530,7 +729,10 @@ player_df['Has BGW'] = player_df['Next GW Opponent 1'].apply(
     lambda x: '⚠️ BGW' if (not isinstance(x, str) or x.strip() == '') else ''
 )
 
-# Last updated timestamp
+# GW average — for xP vs Average comparison column on player level
+player_df['GW Average Points'] = gw_averages.get(current_gameweek, 0)
+player_df['GW Points vs Average'] = player_df['GW Points'] - player_df['GW Average Points']
+
 player_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
 
 # ---------------------------------------------------------------------------
@@ -569,6 +771,8 @@ def create_smart_picks_table(position_name: str, top_n: int) -> pd.DataFrame:
         # Fixture
         'Next GW Opponent', 'Next GW Difficulty', 'Difficulty Score',
         'Has DGW', 'Has BGW',
+        # GW average comparison
+        'GW Average Points', 'GW Points vs Average',
         # Meta
         'Expected points Next GW', 'Current Gameweek', 'Last Updated',
     ]
@@ -578,8 +782,8 @@ def create_smart_picks_table(position_name: str, top_n: int) -> pd.DataFrame:
         next_gw_cols.append(f'Next GW Opponent {i}')
         next_gw_cols.append(f'Next GW Difficulty {i}')
 
-    all_cols  = base_cols + next_gw_cols
-    df_pos    = player_df[player_df['Position'] == position_name].copy()
+    all_cols   = base_cols + next_gw_cols
+    df_pos     = player_df[player_df['Position'] == position_name].copy()
     final_cols = [c for c in all_cols if c in df_pos.columns]
 
     return (
@@ -616,10 +820,10 @@ for fixture in fixtures:
     if not fixture.get('finished'):
         continue
 
-    h_id     = fixture.get('team_h')
-    a_id     = fixture.get('team_a')
-    h_goals  = fixture.get('team_h_score') or 0
-    a_goals  = fixture.get('team_a_score') or 0
+    h_id    = fixture.get('team_h')
+    a_id    = fixture.get('team_a')
+    h_goals = fixture.get('team_h_score') or 0
+    a_goals = fixture.get('team_a_score') or 0
 
     if not (h_id and a_id):
         continue
@@ -631,8 +835,8 @@ for fixture in fixtures:
     teams_df.loc[teams_df['id'] == h_id, 'Games'] += 1
     teams_df.loc[teams_df['id'] == a_id, 'Games'] += 1
 
-    h_short = teams_df.loc[teams_df['id'] == h_id, 'team'].values[0]
-    a_short = teams_df.loc[teams_df['id'] == a_id, 'team'].values[0]
+    h_short    = teams_df.loc[teams_df['id'] == h_id, 'team'].values[0]
+    a_short    = teams_df.loc[teams_df['id'] == a_id, 'team'].values[0]
     result_str = f"{h_short} {h_goals} - {a_goals} {a_short}"
     team_results[h_id].append(result_str)
     team_results[a_id].append(result_str)
@@ -663,63 +867,494 @@ defensive_teams = teams_df.sort_values(
 
 status_code_info = [
     ["Status Code", "Meaning", "FPL Action"],
-    ["'a'", "Available — Fully fit",                    "Start, transfer in freely"],
-    ["'d'", "Doubtful — Minor injury risk",              "Check pre-deadline news"],
-    ["'i'", "Injured — Not available",                  "Sell or bench immediately"],
-    ["'s'", "Suspended — Banned",                       "Avoid until ban served"],
-    ["'u'", "Unavailable — Non-injury reason",          "Avoid for this GW"],
-    ["'n'", "Not in squad — Rotation risk",             "Sell unless price holds value"],
+    ["'a'", "Available — Fully fit",               "Start, transfer in freely"],
+    ["'d'", "Doubtful — Minor injury risk",         "Check pre-deadline news"],
+    ["'i'", "Injured — Not available",             "Sell or bench immediately"],
+    ["'s'", "Suspended — Banned",                  "Avoid until ban served"],
+    ["'u'", "Unavailable — Non-injury reason",     "Avoid for this GW"],
+    ["'n'", "Not in squad — Rotation risk",        "Sell unless price holds value"],
     [],
-    ["Metric",               "Definition",                                        "FPL Usage Tip"],
-    ["xP",                   "ML-predicted points next GW (ensemble model)",      "Primary pick signal — trust over Form"],
-    ["xP_confidence",        "Prediction uncertainty (std dev across models)",    "Low value = high confidence. High = risky"],
-    ["AI_Rating",            "Premium / Good / Average / Monitor / Avoid",        "Quick visual filter for transfers"],
-    ["Captaincy Score",      "xP×0.5 + Form×0.3 + Fixture×0.2",                 "Sort descending for captain pick"],
-    ["Transfer In Score",    "xP×0.4 + Fixture×0.4 + PPG×0.2",                  "Sort descending for who to buy"],
-    ["Differential Score",   "xP × (1 - Ownership%) × 10",                      "High = rank-gaining differentials"],
-    ["FD Index",             "Form ÷ Difficulty Score",                           "In-form players in easy fixtures"],
-    ["XG",                   "Expected Goals (season)",                            "Goal threat indicator"],
-    ["Delta G",              "Goals − xG",                                         "+ve = clinical finisher, −ve = may regress"],
-    ["XA",                   "Expected Assists",                                   "Creative involvement proxy"],
-    ["Delta GI",             "GI − (xG + xA)",                                    "+ve = outperforming, −ve = underperforming"],
-    ["ΔG_GW",                "XG Current GW − XG Previous GW",                   "+ve = improving attacking momentum"],
-    ["ΔGI",                  "XGI Current GW − XGI Previous GW",                 "Weekly momentum tracker"],
-    ["Points Per Million",   "Total Points ÷ Cost",                               "Best value players in the price range"],
-    ["Net GW Transfers",     "GW Transfers In − GW Transfers Out",               "+ve = market buying, price rise likely"],
-    ["Price Rise Score",     "Normalised net transfer direction (−1 to +1)",      "+0.3+ → potential price rise"],
+    ["Metric",             "Definition",                                      "FPL Usage Tip"],
+    ["xP",                 "ML-predicted points next GW (ensemble model)",    "Primary pick signal — trust over Form"],
+    ["xP_confidence",      "Prediction uncertainty (std dev across models)",  "Low = high confidence. High = risky"],
+    ["AI_Rating",          "Premium / Good / Average / Monitor / Avoid",      "Quick visual filter for transfers"],
+    ["Captaincy Score",    "xP×0.5 + Form×0.3 + Fixture×0.2",               "Sort descending for captain pick"],
+    ["Transfer In Score",  "xP×0.4 + Fixture×0.4 + PPG×0.2",                "Sort descending for who to buy"],
+    ["Differential Score", "xP × (1 - Ownership%) × 10",                    "High = rank-gaining differentials"],
+    ["FD Index",           "Form ÷ Difficulty Score",                         "In-form players in easy fixtures"],
+    ["XG",                 "Expected Goals (season)",                          "Goal threat indicator"],
+    ["Delta G",            "Goals − xG",                                       "+ve = clinical, −ve = may regress"],
+    ["XA",                 "Expected Assists",                                 "Creative involvement proxy"],
+    ["Delta GI",           "GI − (xG + xA)",                                  "+ve = outperforming"],
+    ["ΔG_GW",              "XG Current GW − XG Previous GW",                 "+ve = improving momentum"],
+    ["ΔGI",                "XGI Current GW − XGI Previous GW",               "Weekly momentum tracker"],
+    ["Points Per Million", "Total Points ÷ Cost",                             "Best value in price range"],
+    ["Net GW Transfers",   "GW Transfers In − GW Transfers Out",             "+ve = market buying"],
+    ["Price Rise Score",   "Normalised net transfer direction (−1 to +1)",    "+0.3+ → price rise likely"],
+    ["GW Points vs Avg",   "GW Points − GW Average",                          "+ve = beat the field this GW"],
+    [],
+    ["FDR Colour",  "FPL Official Colour",       "Meaning"],
+    ["1",           "#375523 Dark Green",         "Very Easy fixture"],
+    ["2",           "#01FC7A Bright Green",        "Easy fixture"],
+    ["3",           "#E7E7E7 Light Grey",          "Medium fixture"],
+    ["4",           "#FF1751 Red",                 "Hard fixture"],
+    ["5",           "#80072D Dark Red",            "Very Hard fixture"],
+    ["DGW",         "#DAA520 Gold",                "Double Gameweek — team plays twice"],
+    ["BGW",         "#4A4A4A Dark Grey",           "Blank Gameweek — team doesn't play"],
 ]
 
 status_code_df = pd.DataFrame(status_code_info)
 status_code_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
 
 # ---------------------------------------------------------------------------
-# 13. WRITE ALL SHEETS
+# 13. MY FPL — PERSONAL TEAM DATA (Team ID: 2551369)
+# Feeds the My Season page of the dashboard.
+# All sections wrapped in try/except — personal API failure never kills pipeline.
 # ---------------------------------------------------------------------------
 
-print("\n📝 Writing all data to Google Sheets...")
+print("\n" + "="*70)
+print(f"👤 FETCHING PERSONAL FPL DATA (Team ID: {MY_TEAM_ID})")
+print("="*70)
 
-write_to_sheet(sheet, player_df,              'Player Data')
-write_to_sheet(sheet, goalkeepers_smart_picks, 'Smart Picks - Goalkeepers')
-write_to_sheet(sheet, defenders_smart_picks,   'Smart Picks - Defenders')
-write_to_sheet(sheet, midfielders_smart_picks, 'Smart Picks - Midfielders')
-write_to_sheet(sheet, forwards_smart_picks,    'Smart Picks - Forwards')
-write_to_sheet(sheet, attacking_teams,         'Best Attacking Teams')
-write_to_sheet(sheet, defensive_teams,         'Best Defensive Teams')
-write_to_sheet(sheet, status_code_df,          'FPL Key Metrics Guide')
+player_lookup = {p['id']: p for p in players_raw}
+
+# ── 13a. SEASON HISTORY ───────────────────────────────────────────────────
+# One row per completed GW.
+# Now includes KPI delta columns needed by dashboard:
+#   Rank Change, Rank Direction (↑/↓/→), Points vs Average,
+#   Points vs TOTW (Team of the Week), cumulative total.
+
+my_season_history_df = pd.DataFrame()
+
+try:
+    print(f"\n   📡 Fetching season history...")
+    history_data = fetch_fpl_data(
+        f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/history/'
+    )
+
+    if history_data:
+        gw_history = history_data.get('current', [])
+
+        chips_used = {
+            chip.get('event'): chip.get('name', '').replace('_', ' ').title()
+            for chip in history_data.get('chips', [])
+        }
+
+        season_rows   = []
+        running_total = 0
+
+        for gw in gw_history:
+            gw_num  = gw.get('event')
+            gw_pts  = gw.get('points', 0)
+            hits    = gw.get('event_transfers_cost', 0)
+            net_pts = gw_pts - hits
+            running_total += net_pts
+
+            gw_avg  = gw_averages.get(gw_num, 0)
+            gw_high = gw_highest.get(gw_num, 0)
+            vs_avg  = gw_pts - gw_avg
+            vs_high = gw_pts - gw_high
+
+            season_rows.append({
+                'Gameweek':              gw_num,
+                'GW Points':             gw_pts,
+                'Transfers Cost (Hits)': hits,
+                'Net GW Points':         net_pts,
+                'Cumulative Points':     running_total,
+                'Overall Rank':          gw.get('overall_rank'),
+                'GW Rank':               gw.get('rank'),
+                'Team Value':            round(gw.get('value', 0) / 10, 1),
+                'Money In Bank':         round(gw.get('bank', 0) / 10, 1),
+                'Total Transfers Made':  gw.get('event_transfers', 0),
+                'Hit Taken':             'Yes ❌' if hits > 0 else 'No ✅',
+                'Points On Bench':       gw.get('points_on_bench', 0),
+                'GW Average':            gw_avg,
+                'GW Highest Score':      gw_high,
+                'Points vs Average':     vs_avg,
+                'Points vs TOTW':        vs_high,
+                'Beat Average':          'Yes ✅' if vs_avg > 0 else 'No ❌',
+                'Chip Used':             chips_used.get(gw_num, ''),
+            })
+
+        my_season_history_df = pd.DataFrame(season_rows)
+
+        # Rank change (positive = moved UP — improved rank number is smaller)
+        my_season_history_df['Rank Change'] = (
+            my_season_history_df['Overall Rank'].shift(1) -
+            my_season_history_df['Overall Rank']
+        ).fillna(0).astype(int)
+
+        # Rank direction arrow — used by dashboard KPI card
+        my_season_history_df['Rank Direction'] = my_season_history_df['Rank Change'].apply(
+            lambda x: '↑ Improved' if x > 0 else ('↓ Dropped' if x < 0 else '→ Held')
+        )
+
+        # Rank delta display string (e.g. "↑ +18,240" or "↓ -284,476")
+        my_season_history_df['Rank Delta Display'] = my_season_history_df['Rank Change'].apply(
+            lambda x: f"↑ +{x:,}" if x > 0 else (f"↓ {x:,}" if x < 0 else '→ No change')
+        )
+
+        # Points delta display string (e.g. "+73 pts this GW")
+        my_season_history_df['Points Delta Display'] = my_season_history_df['GW Points'].apply(
+            lambda x: f"+{x} pts this GW"
+        )
+
+        # Beat average string
+        my_season_history_df['vs Average Display'] = my_season_history_df['Points vs Average'].apply(
+            lambda x: f"+{x} vs avg" if x > 0 else f"{x} vs avg"
+        )
+
+        my_season_history_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
+
+        print(f"   ✅ Season history: {len(my_season_history_df)} gameweeks")
+        print(f"      Total points : {running_total} | "
+              f"Best rank: #{my_season_history_df['Overall Rank'].min():,}")
+
+    else:
+        print("   ⚠️  Could not fetch season history.")
+
+except Exception as e:
+    print(f"   ❌ Season history fetch failed: {e}")
+
+# ── 13b. CURRENT GW SQUAD ─────────────────────────────────────────────────
+# 15 players this GW — starting XI, bench, captain, VC.
+# Merged with ML predictions and fixture data from the main pipeline.
+# Free transfer logic correctly handles hits and the 1-FT-carry-over rule.
+
+my_current_squad_df = pd.DataFrame()
+
+try:
+    print(f"\n   📡 Fetching GW{current_gameweek} squad picks...")
+    current_squad_data = fetch_fpl_data(
+        f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/event/{current_gameweek}/picks/'
+    )
+
+    if current_squad_data:
+        picks         = current_squad_data.get('picks', [])
+        active_chip   = current_squad_data.get('active_chip') or ''
+        entry_history = current_squad_data.get('entry_history', {})
+
+        # Correct FPL free transfer calculation:
+        # - 1 free transfer per GW by default, carries over to max 2
+        # - Any transfers beyond free allowance cost 4pts each (hit)
+        # - If hit was taken, we know transfers > free allowance
+        transfers_made = entry_history.get('event_transfers', 0)
+        hit_cost       = entry_history.get('event_transfers_cost', 0)
+
+        # Free transfers remaining next GW:
+        # If 0 transfers this GW → banked 1 FT → 2 next GW
+        # If 1 transfer (no hit) → used the FT → 1 next GW
+        # If hit taken → still get 1 FT next GW
+        if transfers_made == 0:
+            free_transfers_next = 2   # banked
+        elif hit_cost == 0:
+            free_transfers_next = max(0, 2 - transfers_made)
+        else:
+            free_transfers_next = 1   # always get 1 after a hit GW
+
+        # xP for starting XI — from the main pipeline (populated after merge below)
+        squad_rows = []
+
+        for pick in picks:
+            pid          = pick['element']
+            multiplier   = pick['multiplier']
+            is_captain   = pick['is_captain']
+            is_vice      = pick['is_vice_captain']
+            position_num = pick['position']
+
+            info = player_lookup.get(pid, {})
+            pos  = positions.get(info.get('element_type'), 'Unknown')
+            team = teams.get(info.get('team'), 'Unknown')
+
+            if is_captain:
+                captain_label = '👑 C' if multiplier == 2 else '👑 TC'
+            elif is_vice:
+                captain_label = 'VC'
+            else:
+                captain_label = ''
+
+            squad_rows.append({
+                'Position Slot':           position_num,
+                'Player Name':             info.get('web_name', 'Unknown'),
+                'Full Name':               f"{info.get('first_name', '')} {info.get('second_name', '')}".strip(),
+                'Team':                    team,
+                'Position':                pos,
+                'Is Starting':             'Yes' if position_num <= 11 else 'No (Bench)',
+                'Captain':                 captain_label,
+                'Multiplier':              multiplier,
+                'Cost':                    round(info.get('now_cost', 0) / 10, 1),
+                'Form':                    info.get('form', 0),
+                'GW Points':               info.get('event_points', 0),
+                'GW Points x Multiplier':  info.get('event_points', 0) * max(multiplier, 1),
+                'Total Points':            info.get('total_points', 0),
+                'Ownership (%)':           info.get('selected_by_percent', 0),
+                'Status':                  info.get('status', 'a'),
+                # Filled from player_df merge below
+                'xP':                      0.0,
+                'xP Next GW':              0.0,
+                'AI_Rating':               'N/A',
+                'Captaincy Score':         0.0,
+                'Next GW Opponent 1':      '',
+                'Next GW Difficulty 1':    '',
+                'FD Index':                0.0,
+                'Delta GI':                0.0,
+                'ΔGI':                     0.0,
+                # Context
+                'Active Chip':             active_chip,
+                'Free Transfers Next GW':  free_transfers_next,
+                'Hit Cost This GW':        hit_cost,
+                'Transfers Made This GW':  transfers_made,
+                'Last Updated':            pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
+            })
+
+        my_current_squad_df = pd.DataFrame(squad_rows)
+
+        # Merge ML predictions + fixture data from the main player_df
+        ml_merge_cols = [
+            'Player Name', 'xP', 'xP_confidence', 'AI_Rating',
+            'Captaincy Score', 'Differential Score', 'Transfer In Score',
+            'Next GW Opponent 1', 'Next GW Difficulty 1',
+            'FD Index', 'Delta GI', 'ΔGI',
+            'Expected points Next GW',
+        ]
+        available_ml_cols = [c for c in ml_merge_cols if c in player_df.columns]
+        merge_source = player_df[available_ml_cols].drop_duplicates('Player Name')
+
+        my_current_squad_df = my_current_squad_df.merge(
+            merge_source,
+            on='Player Name',
+            how='left',
+            suffixes=('', '_merged')
+        )
+
+        for col in ['xP', 'AI_Rating', 'Captaincy Score',
+                    'Next GW Opponent 1', 'Next GW Difficulty 1',
+                    'FD Index', 'Delta GI', 'ΔGI']:
+            merged_col = f'{col}_merged'
+            if merged_col in my_current_squad_df.columns:
+                my_current_squad_df[col] = my_current_squad_df[merged_col].fillna(
+                    my_current_squad_df[col]
+                )
+                my_current_squad_df.drop(columns=[merged_col], inplace=True)
+
+        # xP Next GW alias from Expected points Next GW
+        if 'Expected points Next GW_merged' in my_current_squad_df.columns:
+            my_current_squad_df['xP Next GW'] = my_current_squad_df['Expected points Next GW_merged']
+            my_current_squad_df.drop(columns=['Expected points Next GW_merged'], inplace=True)
+        elif 'Expected points Next GW' in my_current_squad_df.columns:
+            my_current_squad_df['xP Next GW'] = my_current_squad_df['Expected points Next GW']
+
+        # Summary stats
+        starting_xi   = my_current_squad_df[my_current_squad_df['Is Starting'] == 'Yes']
+        bench_players = my_current_squad_df[my_current_squad_df['Is Starting'] == 'No (Bench)']
+        starting_xp   = starting_xi['xP'].sum()
+        bench_xp      = bench_players['xP'].sum()
+        total_gw_pts  = starting_xi['GW Points x Multiplier'].sum()
+
+        print(f"   ✅ Current squad: {len(my_current_squad_df)} players")
+        print(f"      Starting xP: {starting_xp:.1f} | Bench xP: {bench_xp:.1f}")
+        print(f"      GW Points (with captain): {total_gw_pts} | Hit: -£{hit_cost}m")
+        print(f"      Free transfers next GW: {free_transfers_next}")
+        if active_chip:
+            print(f"      🎯 Active chip: {active_chip}")
+
+    else:
+        print(f"   ⚠️  Could not fetch GW{current_gameweek} squad.")
+
+except Exception as e:
+    print(f"   ❌ Current squad fetch failed: {e}")
+
+# ── 13c. TRANSFER HISTORY ─────────────────────────────────────────────────
+
+my_transfers_df = pd.DataFrame()
+
+try:
+    print(f"\n   📡 Fetching transfer history...")
+    transfers_data = fetch_fpl_data(
+        f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/transfers/'
+    )
+
+    if transfers_data:
+        transfer_rows = []
+
+        for t in transfers_data:
+            pid_in   = t.get('element_in')
+            pid_out  = t.get('element_out')
+            info_in  = player_lookup.get(pid_in,  {})
+            info_out = player_lookup.get(pid_out, {})
+
+            cost_in   = round(t.get('element_in_cost',  0) / 10, 1)
+            cost_out  = round(t.get('element_out_cost', 0) / 10, 1)
+            cost_diff = round(cost_in - cost_out, 1)
+
+            transfer_rows.append({
+                'Gameweek':         t.get('event'),
+                'Player In':        info_in.get('web_name', 'Unknown'),
+                'Player In Team':   teams.get(info_in.get('team'), ''),
+                'Player In Cost':   cost_in,
+                'Player In Pos':    positions.get(info_in.get('element_type'), ''),
+                'Player Out':       info_out.get('web_name', 'Unknown'),
+                'Player Out Team':  teams.get(info_out.get('team'), ''),
+                'Player Out Cost':  cost_out,
+                'Player Out Pos':   positions.get(info_out.get('element_type'), ''),
+                'Cost Difference':  cost_diff,
+                'Transfer Time':    t.get('time', ''),
+            })
+
+        my_transfers_df = pd.DataFrame(transfer_rows)
+        my_transfers_df = my_transfers_df.sort_values(
+            by=['Gameweek', 'Transfer Time'], ascending=[False, False]
+        ).reset_index(drop=True)
+        my_transfers_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
+
+        print(f"   ✅ Transfer history: {len(my_transfers_df)} transfers across the season")
+
+    else:
+        print("   ⚠️  Could not fetch transfer history.")
+
+except Exception as e:
+    print(f"   ❌ Transfer history fetch failed: {e}")
+
+# ── 13d. MY FPL KPI SUMMARY ───────────────────────────────────────────────
+# Single-row table that the dashboard reads to populate the 5 KPI cards.
+# This means the dashboard only needs to read ONE cell per KPI — no formulas.
+# Columns: Total Points, Overall Rank, Rank Change, Rank Direction,
+#          Team Value, Free Transfers Next GW, Hit Cost,
+#          xP Starting XI, GW Average, GW Points, GW Points Delta Display,
+#          Rank Delta Display, Active Chip, Last Updated.
+
+my_kpi_df = pd.DataFrame()
+
+try:
+    if not my_season_history_df.empty and not my_current_squad_df.empty:
+
+        latest_gw = my_season_history_df.iloc[-1]
+
+        # Current GW xP prediction (sum of starting XI)
+        starting_xi_xp = (
+            my_current_squad_df[my_current_squad_df['Is Starting'] == 'Yes']['xP'].sum()
+            if not my_current_squad_df.empty else 0.0
+        )
+
+        # xP vs GW average (using ML xP prediction, not actual — forward-looking)
+        gw_avg_pts = gw_averages.get(current_gameweek, 0)
+        xp_vs_avg  = round(starting_xi_xp - gw_avg_pts, 1)
+
+        # Free transfers (from squad section)
+        ft_next = (
+            int(my_current_squad_df['Free Transfers Next GW'].iloc[0])
+            if not my_current_squad_df.empty and 'Free Transfers Next GW' in my_current_squad_df.columns
+            else 1
+        )
+        hit_cost_this_gw = (
+            int(my_current_squad_df['Hit Cost This GW'].iloc[0])
+            if not my_current_squad_df.empty and 'Hit Cost This GW' in my_current_squad_df.columns
+            else 0
+        )
+        active_chip_this_gw = (
+            str(my_current_squad_df['Active Chip'].iloc[0])
+            if not my_current_squad_df.empty and 'Active Chip' in my_current_squad_df.columns
+            else ''
+        )
+
+        kpi_row = {
+            # Points KPI
+            'Total Points':              int(latest_gw['Cumulative Points']),
+            'GW Points':                 int(latest_gw['GW Points']),
+            'GW Points Delta Display':   latest_gw['Points Delta Display'],
+            'Net GW Points':             int(latest_gw['Net GW Points']),
+
+            # Rank KPI
+            'Overall Rank':              int(latest_gw['Overall Rank']),
+            'Rank Change':               int(latest_gw['Rank Change']),
+            'Rank Direction':            latest_gw['Rank Direction'],
+            'Rank Delta Display':        latest_gw['Rank Delta Display'],
+
+            # Team value KPI
+            'Team Value':                float(latest_gw['Team Value']),
+            'Money In Bank':             float(latest_gw['Money In Bank']),
+
+            # xP vs Average KPI
+            'xP Starting XI':            round(starting_xi_xp, 1),
+            'GW Average':                gw_avg_pts,
+            'xP vs Average':             xp_vs_avg,
+            'xP vs Avg Display':         f"+{xp_vs_avg} vs avg" if xp_vs_avg >= 0 else f"{xp_vs_avg} vs avg",
+
+            # Free transfers KPI
+            'Free Transfers Next GW':    ft_next,
+            'Hit Cost This GW':          hit_cost_this_gw,
+            'Hit Display':               f"-{hit_cost_this_gw} pts hit" if hit_cost_this_gw > 0 else 'No hit taken',
+            'Active Chip':               active_chip_this_gw,
+
+            # Season context
+            'Current Gameweek':          int(current_gameweek),
+            'Season Best Rank':          int(my_season_history_df['Overall Rank'].min()),
+            'Season Total Hits Cost':    int(my_season_history_df['Transfers Cost (Hits)'].sum()),
+            'Season Points On Bench':    int(my_season_history_df['Points On Bench'].sum()),
+            'GWs Beat Average':          int((my_season_history_df['Points vs Average'] > 0).sum()),
+
+            'Last Updated':              pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
+        }
+
+        my_kpi_df = pd.DataFrame([kpi_row])
+        print(f"\n   ✅ KPI Summary built for GW{current_gameweek}")
+        print(f"      Points: {kpi_row['Total Points']} | Rank: #{kpi_row['Overall Rank']:,} "
+              f"| {kpi_row['Rank Delta Display']} | xP: {kpi_row['xP Starting XI']}")
+
+except Exception as e:
+    print(f"   ❌ KPI summary build failed: {e}")
 
 # ---------------------------------------------------------------------------
-# 14. PIPELINE SUMMARY
+# 14. WRITE ALL SHEETS
+# ---------------------------------------------------------------------------
+
+print("\n" + "="*70)
+print("📝 WRITING ALL DATA TO GOOGLE SHEETS")
+print("="*70)
+
+# General sheets
+write_to_sheet(sheet, player_df,               'Player Data')
+write_to_sheet(sheet, goalkeepers_smart_picks,  'Smart Picks - Goalkeepers')
+write_to_sheet(sheet, defenders_smart_picks,    'Smart Picks - Defenders')
+write_to_sheet(sheet, midfielders_smart_picks,  'Smart Picks - Midfielders')
+write_to_sheet(sheet, forwards_smart_picks,     'Smart Picks - Forwards')
+write_to_sheet(sheet, attacking_teams,          'Best Attacking Teams')
+write_to_sheet(sheet, defensive_teams,          'Best Defensive Teams')
+write_to_sheet(sheet, fixture_planner_df,       'Fixture Planner')
+write_to_sheet(sheet, status_code_df,           'FPL Key Metrics Guide')
+
+# Personal sheets
+if not my_season_history_df.empty:
+    write_to_sheet(sheet, my_season_history_df,  'My FPL - Season History')
+
+if not my_current_squad_df.empty:
+    write_to_sheet(sheet, my_current_squad_df,   'My FPL - Current Squad')
+
+if not my_transfers_df.empty:
+    write_to_sheet(sheet, my_transfers_df,        'My FPL - Transfers')
+
+if not my_kpi_df.empty:
+    write_to_sheet(sheet, my_kpi_df,              'My FPL - KPI Summary')
+
+# ---------------------------------------------------------------------------
+# 15. PIPELINE SUMMARY
 # ---------------------------------------------------------------------------
 
 print("\n" + "="*70)
 print("✅ FPL DATA PIPELINE COMPLETED SUCCESSFULLY!")
 print("="*70)
-print(f"  📊 Players processed   : {len(player_df)}")
-print(f"  🤖 ML predictions      : {'✅ Active' if ml_success else '⚠️  Fallback (Form)'}")
-print(f"  📈 New columns added   : xP · xP_confidence · AI_Rating · Captaincy Score")
-print(f"                           Transfer In Score · Differential Score · FD Index")
-print(f"                           Net GW Transfers · Price Rise Score · Points Per Million")
-print(f"  📅 Gameweek            : GW{current_gameweek}")
-print(f"  🔗 Sheet               : https://docs.google.com/spreadsheets/d/{sheet_id}")
-print(f"  ⏱️  Completed           : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M UTC')}")
+print(f"  📊 Players processed    : {len(player_df)}")
+print(f"  🤖 ML predictions       : {'✅ Active' if ml_success else '⚠️  Fallback (Form)'}")
+print(f"  📅 Fixture Planner      : {len(fixture_planner_df)} teams × {len(next_8_gameweeks)} GWs (FPL colours)")
+print(f"  👤 Personal data        : Team ID {MY_TEAM_ID}")
+print(f"     Season history       : {len(my_season_history_df)} GWs" if not my_season_history_df.empty else "     Season history       : ⚠️  Skipped")
+print(f"     Current squad        : {len(my_current_squad_df)} players" if not my_current_squad_df.empty else "     Current squad        : ⚠️  Skipped")
+print(f"     Transfer history     : {len(my_transfers_df)} transfers" if not my_transfers_df.empty else "     Transfer history     : ⚠️  Skipped")
+print(f"     KPI Summary          : {'✅ Written' if not my_kpi_df.empty else '⚠️  Skipped'}")
+print(f"  📈 New columns          : GW Points vs Average · Rank Delta Display · Points Delta Display")
+print(f"                            Free Transfers Next GW · Hit Display · FDR Colours (FPL official)")
+print(f"                            DGW/BGW auto-detection · Avg FDR Next 3/5/8 GW · Fixture Rating")
+print(f"  📅 Gameweek             : GW{current_gameweek}")
+print(f"  🔗 Sheet                : https://docs.google.com/spreadsheets/d/{sheet_id}")
+print(f"  ⏱️  Completed            : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M UTC')}")
 print("="*70)
