@@ -1,4 +1,4 @@
-# Automated FPL Analytics Pipeline — End-to-End Data Engineering Project 
+# Real-Time Sports Analytics & Decision Intelligence Platform — End-to-End Data Engineering Project 
 
 ## Problem
 8M+ FPL managers make 40M+ transfers weekly with limited data.
