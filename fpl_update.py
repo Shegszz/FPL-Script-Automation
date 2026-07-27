@@ -111,18 +111,9 @@ def write_to_sheet(sheet, df: pd.DataFrame, sheet_name: str) -> None:
     except gspread.exceptions.WorksheetNotFound:
         worksheet = sheet.add_worksheet(title=sheet_name, rows="2000", cols="60")
 
-    # A DataFrame built from an empty list of rows (e.g. pd.DataFrame([]))
-    # has 0 columns as well as 0 rows. gspread_dataframe resizes the sheet
-    # to the DataFrame's exact shape, and asking Google Sheets for 0
-    # columns is an invalid request. A single "no data yet" placeholder
-    # column keeps this safe while still correctly clearing out stale rows
-    # from a previous run — e.g. a personal sheet during preseason.
-    if df.shape[1] == 0:
-        df = pd.DataFrame({'Status': ['No data yet']})
-
     worksheet.clear()
     set_with_dataframe(worksheet, df, include_column_header=True, resize=True)
-    worksheet.freeze(rows=1, cols=min(2, len(df.columns)))
+    worksheet.freeze(rows=1, cols=2)
     print(f"   ✅ Written: '{sheet_name}' ({len(df)} rows × {len(df.columns)} cols)")
 
 
@@ -222,18 +213,6 @@ if current_gameweek is None:
     current_gameweek = max(e['id'] for e in events if e.get('finished'))
 
 print(f"   ✅ Current Gameweek: {current_gameweek}")
-
-# ---------------------------------------------------------------------------
-# SEASON LABEL — derived from GW1's real deadline date, never the system clock
-# or a hardcoded string. The PL season always starts in August, so GW1's
-# deadline year is the authoritative "season start year" straight from the
-# FPL API. This means the label auto-advances every season with zero code
-# changes — no more "2025/26" baked in somewhere and forgotten.
-# ---------------------------------------------------------------------------
-gw1_deadline = next((e.get('deadline_time') for e in events if e['id'] == 1), None)
-season_start_year = int(gw1_deadline[:4]) if gw1_deadline else pd.Timestamp.now().year
-season_label = f"{season_start_year}/{str(season_start_year + 1)[-2:]}"
-print(f"   ✅ Season: {season_label}")
 
 # Next 5 GWs — for player columns in Player Data sheet
 next_5_gameweeks = [
@@ -388,7 +367,6 @@ for player in players_raw:
         'Team':             teams[player['team']],
         'Position':         positions[player['element_type']],
         'Availability':     player['status'],
-        'Removed':          player.get('removed', False),   # New field this season — True for players no longer in the PL
         'Current Gameweek': current_gameweek,
 
         # Pricing
@@ -945,18 +923,8 @@ player_lookup = {p['id']: p for p in players_raw}
 # Now includes KPI delta columns needed by dashboard:
 #   Rank Change, Rank Direction (↑/↓/→), Points vs Average,
 #   Points vs TOTW (Team of the Week), cumulative total.
-#
-# history_fetch_ok distinguishes "the API call failed" from "the API call
-# succeeded and correctly says there's no data yet" (e.g. preseason, before
-# GW1). Those used to be treated identically — both left this sheet
-# untouched — which meant every preseason the sheet (and therefore the
-# dashboard's headline numbers) stayed frozen on last season's final
-# stats. Now a genuine "nothing yet" response overwrites that stale data
-# with an honest, empty, up-to-date sheet instead.
 
 my_season_history_df = pd.DataFrame()
-my_past_seasons_df   = pd.DataFrame()
-history_fetch_ok     = False
 
 try:
     print(f"\n   📡 Fetching season history...")
@@ -964,8 +932,7 @@ try:
         f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/history/'
     )
 
-    if history_data is not None:
-        history_fetch_ok = True
+    if history_data:
         gw_history = history_data.get('current', [])
 
         chips_used = {
@@ -1011,63 +978,40 @@ try:
 
         my_season_history_df = pd.DataFrame(season_rows)
 
-        if not my_season_history_df.empty:
-            # Rank change (positive = moved UP — improved rank number is smaller)
-            my_season_history_df['Rank Change'] = (
-                my_season_history_df['Overall Rank'].shift(1) -
-                my_season_history_df['Overall Rank']
-            ).fillna(0).astype(int)
+        # Rank change (positive = moved UP — improved rank number is smaller)
+        my_season_history_df['Rank Change'] = (
+            my_season_history_df['Overall Rank'].shift(1) -
+            my_season_history_df['Overall Rank']
+        ).fillna(0).astype(int)
 
-            # Rank direction arrow — used by dashboard KPI card
-            my_season_history_df['Rank Direction'] = my_season_history_df['Rank Change'].apply(
-                lambda x: '↑ Improved' if x > 0 else ('↓ Dropped' if x < 0 else '→ Held')
-            )
+        # Rank direction arrow — used by dashboard KPI card
+        my_season_history_df['Rank Direction'] = my_season_history_df['Rank Change'].apply(
+            lambda x: '↑ Improved' if x > 0 else ('↓ Dropped' if x < 0 else '→ Held')
+        )
 
-            # Rank delta display string (e.g. "↑ +18,240" or "↓ -284,476")
-            my_season_history_df['Rank Delta Display'] = my_season_history_df['Rank Change'].apply(
-                lambda x: f"↑ +{x:,}" if x > 0 else (f"↓ {x:,}" if x < 0 else '→ No change')
-            )
+        # Rank delta display string (e.g. "↑ +18,240" or "↓ -284,476")
+        my_season_history_df['Rank Delta Display'] = my_season_history_df['Rank Change'].apply(
+            lambda x: f"↑ +{x:,}" if x > 0 else (f"↓ {x:,}" if x < 0 else '→ No change')
+        )
 
-            # Points delta display string (e.g. "+73 pts this GW")
-            # Leading apostrophe forces Sheets to treat this as literal text —
-            # without it, a cell value starting with "+" gets auto-parsed as
-            # the start of a formula and displays "#ERROR!" instead of the text.
-            my_season_history_df['Points Delta Display'] = my_season_history_df['GW Points'].apply(
-                lambda x: f"'+{x} pts this GW"
-            )
+        # Points delta display string (e.g. "+73 pts this GW")
+        my_season_history_df['Points Delta Display'] = my_season_history_df['GW Points'].apply(
+            lambda x: f"+{x} pts this GW"
+        )
 
-            # Beat average string — same leading-character issue when positive
-            my_season_history_df['vs Average Display'] = my_season_history_df['Points vs Average'].apply(
-                lambda x: f"'+{x} vs avg" if x > 0 else f"{x} vs avg"
-            )
+        # Beat average string
+        my_season_history_df['vs Average Display'] = my_season_history_df['Points vs Average'].apply(
+            lambda x: f"+{x} vs avg" if x > 0 else f"{x} vs avg"
+        )
 
-            my_season_history_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
+        my_season_history_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
 
-            print(f"   ✅ Season history: {len(my_season_history_df)} gameweeks")
-            print(f"      Total points : {running_total} | "
-                  f"Best rank: #{my_season_history_df['Overall Rank'].min():,}")
-        else:
-            print("   ℹ️  No completed gameweeks yet this season — writing an empty, up-to-date history sheet.")
-
-        # Real past-season summaries straight from the FPL API (season name,
-        # points, rank). This replaces any hand-maintained/hardcoded past
-        # seasons list on the dashboard side — it's always accurate and
-        # never needs a manual edit when a season rolls over.
-        past_rows = [
-            {
-                'Season':       ps.get('season_name', ''),
-                'Total Points': ps.get('total_points', 0),
-                'Overall Rank': ps.get('rank'),
-            }
-            for ps in history_data.get('past', [])
-        ]
-        my_past_seasons_df = pd.DataFrame(past_rows)
-        if not my_past_seasons_df.empty:
-            my_past_seasons_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
-        print(f"   ✅ Past seasons on record: {len(my_past_seasons_df)}")
+        print(f"   ✅ Season history: {len(my_season_history_df)} gameweeks")
+        print(f"      Total points : {running_total} | "
+              f"Best rank: #{my_season_history_df['Overall Rank'].min():,}")
 
     else:
-        print("   ⚠️  Could not fetch season history (no response after retries) — leaving existing sheet untouched.")
+        print("   ⚠️  Could not fetch season history.")
 
 except Exception as e:
     print(f"   ❌ Season history fetch failed: {e}")
@@ -1076,16 +1020,8 @@ except Exception as e:
 # 15 players this GW — starting XI, bench, captain, VC.
 # Merged with ML predictions and fixture data from the main pipeline.
 # Free transfer logic correctly handles hits and the 1-FT-carry-over rule.
-# squad_fetch_ok follows the same "failed vs genuinely empty" reasoning as
-# 13a. squad_team_value / squad_bank are captured here (straight from
-# entry_history, which FPL populates even before GW1) so the KPI section
-# below has a real number to show for Team Value during preseason instead
-# of a placeholder.
 
 my_current_squad_df = pd.DataFrame()
-squad_fetch_ok       = False
-squad_team_value     = 0.0
-squad_bank           = 0.0
 
 try:
     print(f"\n   📡 Fetching GW{current_gameweek} squad picks...")
@@ -1093,13 +1029,10 @@ try:
         f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/event/{current_gameweek}/picks/'
     )
 
-    if current_squad_data is not None:
-        squad_fetch_ok = True
+    if current_squad_data:
         picks         = current_squad_data.get('picks', [])
         active_chip   = current_squad_data.get('active_chip') or ''
         entry_history = current_squad_data.get('entry_history', {})
-        squad_team_value = round(entry_history.get('value', 0) / 10, 1)
-        squad_bank       = round(entry_history.get('bank', 0) / 10, 1)
 
         # Correct FPL free transfer calculation:
         # - 1 free transfer per GW by default, carries over to max 2
@@ -1176,68 +1109,64 @@ try:
 
         my_current_squad_df = pd.DataFrame(squad_rows)
 
-        if not my_current_squad_df.empty:
-            # Merge ML predictions + fixture data from the main player_df
-            ml_merge_cols = [
-                'Player Name', 'xP', 'xP_confidence', 'AI_Rating',
-                'Captaincy Score', 'Differential Score', 'Transfer In Score',
-                'Next GW Opponent 1', 'Next GW Difficulty 1',
-                'FD Index', 'Delta GI', 'ΔGI',
-                'Expected points Next GW',
-            ]
-            available_ml_cols = [c for c in ml_merge_cols if c in player_df.columns]
-            merge_source = player_df[available_ml_cols].drop_duplicates('Player Name')
+        # Merge ML predictions + fixture data from the main player_df
+        ml_merge_cols = [
+            'Player Name', 'xP', 'xP_confidence', 'AI_Rating',
+            'Captaincy Score', 'Differential Score', 'Transfer In Score',
+            'Next GW Opponent 1', 'Next GW Difficulty 1',
+            'FD Index', 'Delta GI', 'ΔGI',
+            'Expected points Next GW',
+        ]
+        available_ml_cols = [c for c in ml_merge_cols if c in player_df.columns]
+        merge_source = player_df[available_ml_cols].drop_duplicates('Player Name')
 
-            my_current_squad_df = my_current_squad_df.merge(
-                merge_source,
-                on='Player Name',
-                how='left',
-                suffixes=('', '_merged')
-            )
+        my_current_squad_df = my_current_squad_df.merge(
+            merge_source,
+            on='Player Name',
+            how='left',
+            suffixes=('', '_merged')
+        )
 
-            for col in ['xP', 'AI_Rating', 'Captaincy Score',
-                        'Next GW Opponent 1', 'Next GW Difficulty 1',
-                        'FD Index', 'Delta GI', 'ΔGI']:
-                merged_col = f'{col}_merged'
-                if merged_col in my_current_squad_df.columns:
-                    my_current_squad_df[col] = my_current_squad_df[merged_col].fillna(
-                        my_current_squad_df[col]
-                    )
-                    my_current_squad_df.drop(columns=[merged_col], inplace=True)
+        for col in ['xP', 'AI_Rating', 'Captaincy Score',
+                    'Next GW Opponent 1', 'Next GW Difficulty 1',
+                    'FD Index', 'Delta GI', 'ΔGI']:
+            merged_col = f'{col}_merged'
+            if merged_col in my_current_squad_df.columns:
+                my_current_squad_df[col] = my_current_squad_df[merged_col].fillna(
+                    my_current_squad_df[col]
+                )
+                my_current_squad_df.drop(columns=[merged_col], inplace=True)
 
-            # xP Next GW alias from Expected points Next GW
-            if 'Expected points Next GW_merged' in my_current_squad_df.columns:
-                my_current_squad_df['xP Next GW'] = my_current_squad_df['Expected points Next GW_merged']
-                my_current_squad_df.drop(columns=['Expected points Next GW_merged'], inplace=True)
-            elif 'Expected points Next GW' in my_current_squad_df.columns:
-                my_current_squad_df['xP Next GW'] = my_current_squad_df['Expected points Next GW']
+        # xP Next GW alias from Expected points Next GW
+        if 'Expected points Next GW_merged' in my_current_squad_df.columns:
+            my_current_squad_df['xP Next GW'] = my_current_squad_df['Expected points Next GW_merged']
+            my_current_squad_df.drop(columns=['Expected points Next GW_merged'], inplace=True)
+        elif 'Expected points Next GW' in my_current_squad_df.columns:
+            my_current_squad_df['xP Next GW'] = my_current_squad_df['Expected points Next GW']
 
-            # Summary stats
-            starting_xi   = my_current_squad_df[my_current_squad_df['Is Starting'] == 'Yes']
-            bench_players = my_current_squad_df[my_current_squad_df['Is Starting'] == 'No (Bench)']
-            starting_xp   = starting_xi['xP'].sum()
-            bench_xp      = bench_players['xP'].sum()
-            total_gw_pts  = starting_xi['GW Points x Multiplier'].sum()
+        # Summary stats
+        starting_xi   = my_current_squad_df[my_current_squad_df['Is Starting'] == 'Yes']
+        bench_players = my_current_squad_df[my_current_squad_df['Is Starting'] == 'No (Bench)']
+        starting_xp   = starting_xi['xP'].sum()
+        bench_xp      = bench_players['xP'].sum()
+        total_gw_pts  = starting_xi['GW Points x Multiplier'].sum()
 
-            print(f"   ✅ Current squad: {len(my_current_squad_df)} players")
-            print(f"      Starting xP: {starting_xp:.1f} | Bench xP: {bench_xp:.1f}")
-            print(f"      GW Points (with captain): {total_gw_pts} | Hit: -£{hit_cost}m")
-            print(f"      Free transfers next GW: {free_transfers_next}")
-            if active_chip:
-                print(f"      🎯 Active chip: {active_chip}")
-        else:
-            print(f"   ℹ️  No squad picks saved yet for GW{current_gameweek} — writing an empty, up-to-date squad sheet.")
+        print(f"   ✅ Current squad: {len(my_current_squad_df)} players")
+        print(f"      Starting xP: {starting_xp:.1f} | Bench xP: {bench_xp:.1f}")
+        print(f"      GW Points (with captain): {total_gw_pts} | Hit: -£{hit_cost}m")
+        print(f"      Free transfers next GW: {free_transfers_next}")
+        if active_chip:
+            print(f"      🎯 Active chip: {active_chip}")
 
     else:
-        print(f"   ⚠️  Could not fetch GW{current_gameweek} squad (no response after retries) — leaving existing sheet untouched.")
+        print(f"   ⚠️  Could not fetch GW{current_gameweek} squad.")
 
 except Exception as e:
     print(f"   ❌ Current squad fetch failed: {e}")
 
 # ── 13c. TRANSFER HISTORY ─────────────────────────────────────────────────
 
-my_transfers_df    = pd.DataFrame()
-transfers_fetch_ok = False
+my_transfers_df = pd.DataFrame()
 
 try:
     print(f"\n   📡 Fetching transfer history...")
@@ -1245,8 +1174,7 @@ try:
         f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/transfers/'
     )
 
-    if transfers_data is not None:
-        transfers_fetch_ok = True
+    if transfers_data:
         transfer_rows = []
 
         for t in transfers_data:
@@ -1274,18 +1202,15 @@ try:
             })
 
         my_transfers_df = pd.DataFrame(transfer_rows)
+        my_transfers_df = my_transfers_df.sort_values(
+            by=['Gameweek', 'Transfer Time'], ascending=[False, False]
+        ).reset_index(drop=True)
+        my_transfers_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
 
-        if not my_transfers_df.empty:
-            my_transfers_df = my_transfers_df.sort_values(
-                by=['Gameweek', 'Transfer Time'], ascending=[False, False]
-            ).reset_index(drop=True)
-            my_transfers_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
-            print(f"   ✅ Transfer history: {len(my_transfers_df)} transfers across the season")
-        else:
-            print("   ℹ️  No transfers made yet this season — writing an empty, up-to-date transfers sheet.")
+        print(f"   ✅ Transfer history: {len(my_transfers_df)} transfers across the season")
 
     else:
-        print("   ⚠️  Could not fetch transfer history (no response after retries) — leaving existing sheet untouched.")
+        print("   ⚠️  Could not fetch transfer history.")
 
 except Exception as e:
     print(f"   ❌ Transfer history fetch failed: {e}")
@@ -1296,34 +1221,19 @@ except Exception as e:
 # Columns: Total Points, Overall Rank, Rank Change, Rank Direction,
 #          Team Value, Free Transfers Next GW, Hit Cost,
 #          xP Starting XI, GW Average, GW Points, GW Points Delta Display,
-#          Rank Delta Display, Active Chip, Season Label, Season Status,
-#          Last Updated.
-#
-# THE CORE FIX: this used to only rebuild when BOTH history and squad had
-# rows — which is precisely false every preseason. That meant the sheet
-# (and therefore the dashboard's topbar season pill and all five headline
-# KPI cards) stayed frozen on whatever was last written, i.e. last
-# season's final numbers, for the entire close season. It now rebuilds
-# whenever EITHER fetch succeeded, using honest zero/blank values for
-# whichever half (history or squad) genuinely has nothing yet, tagged
-# with a 'Season Status' the dashboard can use to show "Preseason"
-# instead of pretending those zeros are real form.
+#          Rank Delta Display, Active Chip, Last Updated.
 
 my_kpi_df = pd.DataFrame()
 
 try:
-    if history_fetch_ok or squad_fetch_ok:
+    if not my_season_history_df.empty and not my_current_squad_df.empty:
 
-        has_history = not my_season_history_df.empty
-        has_squad   = not my_current_squad_df.empty
+        latest_gw = my_season_history_df.iloc[-1]
 
-        latest_gw = my_season_history_df.iloc[-1] if has_history else None
-
-        # Current GW xP prediction (sum of starting XI) — available even
-        # preseason, since a saved squad already has ML predictions merged in.
+        # Current GW xP prediction (sum of starting XI)
         starting_xi_xp = (
             my_current_squad_df[my_current_squad_df['Is Starting'] == 'Yes']['xP'].sum()
-            if has_squad else 0.0
+            if not my_current_squad_df.empty else 0.0
         )
 
         # xP vs GW average (using ML xP prediction, not actual — forward-looking)
@@ -1333,75 +1243,63 @@ try:
         # Free transfers (from squad section)
         ft_next = (
             int(my_current_squad_df['Free Transfers Next GW'].iloc[0])
-            if has_squad and 'Free Transfers Next GW' in my_current_squad_df.columns
+            if not my_current_squad_df.empty and 'Free Transfers Next GW' in my_current_squad_df.columns
             else 1
         )
         hit_cost_this_gw = (
             int(my_current_squad_df['Hit Cost This GW'].iloc[0])
-            if has_squad and 'Hit Cost This GW' in my_current_squad_df.columns
+            if not my_current_squad_df.empty and 'Hit Cost This GW' in my_current_squad_df.columns
             else 0
         )
         active_chip_this_gw = (
             str(my_current_squad_df['Active Chip'].iloc[0])
-            if has_squad and 'Active Chip' in my_current_squad_df.columns
+            if not my_current_squad_df.empty and 'Active Chip' in my_current_squad_df.columns
             else ''
         )
 
         kpi_row = {
-            # Points KPI — honest 0s when no GW has been played yet this season
-            'Total Points':              int(latest_gw['Cumulative Points']) if has_history else 0,
-            'GW Points':                 int(latest_gw['GW Points']) if has_history else 0,
-            'GW Points Delta Display':   latest_gw['Points Delta Display'] if has_history else 'Season not started',
-            'Net GW Points':             int(latest_gw['Net GW Points']) if has_history else 0,
+            # Points KPI
+            'Total Points':              int(latest_gw['Cumulative Points']),
+            'GW Points':                 int(latest_gw['GW Points']),
+            'GW Points Delta Display':   latest_gw['Points Delta Display'],
+            'Net GW Points':             int(latest_gw['Net GW Points']),
 
             # Rank KPI
-            'Overall Rank':              int(latest_gw['Overall Rank']) if has_history else 0,
-            'Rank Change':               int(latest_gw['Rank Change']) if has_history else 0,
-            'Rank Direction':            latest_gw['Rank Direction'] if has_history else '—',
-            'Rank Delta Display':        latest_gw['Rank Delta Display'] if has_history else '—',
+            'Overall Rank':              int(latest_gw['Overall Rank']),
+            'Rank Change':               int(latest_gw['Rank Change']),
+            'Rank Direction':            latest_gw['Rank Direction'],
+            'Rank Delta Display':        latest_gw['Rank Delta Display'],
 
-            # Team value KPI — falls back to the live squad value/bank
-            # (captured in 13b from entry_history) when there's no history yet
-            'Team Value':                float(latest_gw['Team Value']) if has_history else squad_team_value,
-            'Money In Bank':             float(latest_gw['Money In Bank']) if has_history else squad_bank,
+            # Team value KPI
+            'Team Value':                float(latest_gw['Team Value']),
+            'Money In Bank':             float(latest_gw['Money In Bank']),
 
             # xP vs Average KPI
             'xP Starting XI':            round(starting_xi_xp, 1),
             'GW Average':                gw_avg_pts,
             'xP vs Average':             xp_vs_avg,
-            # Leading apostrophe forces literal text — see note in 13a above
-            'xP vs Avg Display':         f"'+{xp_vs_avg} vs avg" if xp_vs_avg >= 0 else f"{xp_vs_avg} vs avg",
+            'xP vs Avg Display':         f"+{xp_vs_avg} vs avg" if xp_vs_avg >= 0 else f"{xp_vs_avg} vs avg",
 
             # Free transfers KPI
             'Free Transfers Next GW':    ft_next,
             'Hit Cost This GW':          hit_cost_this_gw,
-            'Hit Display':               f"'-{hit_cost_this_gw} pts hit" if hit_cost_this_gw > 0 else 'No hit taken',
+            'Hit Display':               f"-{hit_cost_this_gw} pts hit" if hit_cost_this_gw > 0 else 'No hit taken',
             'Active Chip':               active_chip_this_gw,
 
             # Season context
             'Current Gameweek':          int(current_gameweek),
-            'Season Label':              season_label,
-            'Season Status':             'Active' if has_history else 'Preseason',
-            'Season Best Rank':          int(my_season_history_df['Overall Rank'].min()) if has_history else 0,
-            'Season Total Hits Cost':    int(my_season_history_df['Transfers Cost (Hits)'].sum()) if has_history else 0,
-            'Season Points On Bench':    int(my_season_history_df['Points On Bench'].sum()) if has_history else 0,
-            'GWs Beat Average':          int((my_season_history_df['Points vs Average'] > 0).sum()) if has_history else 0,
+            'Season Best Rank':          int(my_season_history_df['Overall Rank'].min()),
+            'Season Total Hits Cost':    int(my_season_history_df['Transfers Cost (Hits)'].sum()),
+            'Season Points On Bench':    int(my_season_history_df['Points On Bench'].sum()),
+            'GWs Beat Average':          int((my_season_history_df['Points vs Average'] > 0).sum()),
 
             'Last Updated':              pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
         }
 
         my_kpi_df = pd.DataFrame([kpi_row])
-
-        if has_history:
-            print(f"\n   ✅ KPI Summary built for GW{current_gameweek} ({season_label}, Active)")
-            print(f"      Points: {kpi_row['Total Points']} | Rank: #{kpi_row['Overall Rank']:,} "
-                  f"| {kpi_row['Rank Delta Display']} | xP: {kpi_row['xP Starting XI']}")
-        else:
-            print(f"\n   ✅ KPI Summary built for GW{current_gameweek} ({season_label}, Preseason)")
-            print(f"      Team Value: £{kpi_row['Team Value']}m | Starting XI xP: {kpi_row['xP Starting XI']}")
-
-    else:
-        print("   ⚠️  Skipping KPI summary — neither history nor squad fetch succeeded this run; leaving existing sheet untouched.")
+        print(f"\n   ✅ KPI Summary built for GW{current_gameweek}")
+        print(f"      Points: {kpi_row['Total Points']} | Rank: #{kpi_row['Overall Rank']:,} "
+              f"| {kpi_row['Rank Delta Display']} | xP: {kpi_row['xP Starting XI']}")
 
 except Exception as e:
     print(f"   ❌ KPI summary build failed: {e}")
@@ -1425,18 +1323,14 @@ write_to_sheet(sheet, defensive_teams,          'Best Defensive Teams')
 write_to_sheet(sheet, fixture_planner_df,       'Fixture Planner')
 write_to_sheet(sheet, status_code_df,           'FPL Key Metrics Guide')
 
-# Personal sheets — gated on whether the fetch actually succeeded, not on
-# whether the result happened to be empty. A real fetch failure preserves
-# whatever is already in the sheet; a successful-but-empty response (e.g.
-# preseason) correctly overwrites stale data with an honest empty state.
-if history_fetch_ok:
+# Personal sheets
+if not my_season_history_df.empty:
     write_to_sheet(sheet, my_season_history_df,  'My FPL - Season History')
-    write_to_sheet(sheet, my_past_seasons_df,     'My FPL - Past Seasons')
 
-if squad_fetch_ok:
+if not my_current_squad_df.empty:
     write_to_sheet(sheet, my_current_squad_df,   'My FPL - Current Squad')
 
-if transfers_fetch_ok:
+if not my_transfers_df.empty:
     write_to_sheet(sheet, my_transfers_df,        'My FPL - Transfers')
 
 if not my_kpi_df.empty:
@@ -1452,12 +1346,11 @@ print("="*70)
 print(f"  📊 Players processed    : {len(player_df)}")
 print(f"  🤖 ML predictions       : {'✅ Active' if ml_success else '⚠️  Fallback (Form)'}")
 print(f"  📅 Fixture Planner      : {len(fixture_planner_df)} teams × {len(next_8_gameweeks)} GWs (FPL colours)")
-print(f"  👤 Personal data        : Team ID {MY_TEAM_ID} · Season {season_label}")
-print(f"     Season history       : {len(my_season_history_df)} GWs (written)" if history_fetch_ok else "     Season history       : ⚠️  Fetch failed — sheet left untouched")
-print(f"     Past seasons         : {len(my_past_seasons_df)} seasons (written)" if history_fetch_ok else "     Past seasons         : ⚠️  Fetch failed — sheet left untouched")
-print(f"     Current squad        : {len(my_current_squad_df)} players (written)" if squad_fetch_ok else "     Current squad        : ⚠️  Fetch failed — sheet left untouched")
-print(f"     Transfer history     : {len(my_transfers_df)} transfers (written)" if transfers_fetch_ok else "     Transfer history     : ⚠️  Fetch failed — sheet left untouched")
-print(f"     KPI Summary          : ✅ Written ({my_kpi_df.iloc[0]['Season Status']})" if not my_kpi_df.empty else "     KPI Summary          : ⚠️  Skipped")
+print(f"  👤 Personal data        : Team ID {MY_TEAM_ID}")
+print(f"     Season history       : {len(my_season_history_df)} GWs" if not my_season_history_df.empty else "     Season history       : ⚠️  Skipped")
+print(f"     Current squad        : {len(my_current_squad_df)} players" if not my_current_squad_df.empty else "     Current squad        : ⚠️  Skipped")
+print(f"     Transfer history     : {len(my_transfers_df)} transfers" if not my_transfers_df.empty else "     Transfer history     : ⚠️  Skipped")
+print(f"     KPI Summary          : {'✅ Written' if not my_kpi_df.empty else '⚠️  Skipped'}")
 print(f"  📈 New columns          : GW Points vs Average · Rank Delta Display · Points Delta Display")
 print(f"                            Free Transfers Next GW · Hit Display · FDR Colours (FPL official)")
 print(f"                            DGW/BGW auto-detection · Avg FDR Next 3/5/8 GW · Fixture Rating")
