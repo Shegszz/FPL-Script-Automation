@@ -210,22 +210,36 @@ current_gameweek = next(
 )
 
 if current_gameweek is None:
-    current_gameweek = max(e['id'] for e in events if e.get('finished'))
+    finished_events = [e['id'] for e in events if e.get('finished')]
+    current_gameweek = max(finished_events) if finished_events else 1  # brand-new season safety net
 
-print(f"   ✅ Current Gameweek: {current_gameweek}")
+# Has ANY gameweek actually been played yet this season?
+season_started = any(e.get('finished') for e in events)
+
+# BUG FIX: fixture lookahead used to always start at current_gameweek + 1,
+# which meant GW1 vanished from the Fixture Planner / player fixture columns
+# the moment the season reset (current_gameweek resolves to 1, but the old
+# code started counting from 2). Fixtures should start at the current GW
+# as long as that GW hasn't finished yet — only roll forward once it has.
+current_gw_obj      = next((e for e in events if e['id'] == current_gameweek), {})
+current_gw_finished = bool(current_gw_obj.get('finished', False))
+fixture_start_gw    = current_gameweek if not current_gw_finished else current_gameweek + 1
+
+print(f"   ✅ Current Gameweek: {current_gameweek} (finished: {current_gw_finished})")
+print(f"   ℹ️  Season started: {season_started} | Fixture window starts at GW{fixture_start_gw}")
 
 # Next 5 GWs — for player columns in Player Data sheet
 next_5_gameweeks = [
     {'id': e['id'], 'name': e['name']}
     for e in events
-    if e['id'] > current_gameweek
+    if e['id'] >= fixture_start_gw
 ][:5]
 
 # Next 8 GWs — for FDR heatmap in Fixture Planner sheet
 next_8_gameweeks = [
     {'id': e['id'], 'name': e['name']}
     for e in events
-    if e['id'] > current_gameweek
+    if e['id'] >= fixture_start_gw
 ][:8]
 
 # GW average points lookup — used for xP vs Average comparisons
@@ -932,8 +946,23 @@ try:
         f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/history/'
     )
 
-    if history_data:
+    if history_data is not None:
         gw_history = history_data.get('current', [])
+
+        if not gw_history:
+            # Season has produced zero GW results (fresh season, GW1 not
+            # played yet). The OLD code just skipped writing here, which
+            # left last season's final sheet sitting there looking "live".
+            # Writing an explicit placeholder clears that stale data and
+            # gives the dashboard something concrete to detect.
+            my_season_history_df = pd.DataFrame([{
+                'Season Status': 'not_started',
+                'Gameweek':      current_gameweek,
+                'Message':       f'Waiting for GW{current_gameweek} to kick off',
+                'Last Updated':  pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
+            }])
+            print(f"   ℹ️  Season not started yet (0 GWs played). Placeholder written.")
+            gw_history = []  # skip the loop below
 
         chips_used = {
             chip.get('event'): chip.get('name', '').replace('_', ' ').title()
@@ -976,42 +1005,48 @@ try:
                 'Chip Used':             chips_used.get(gw_num, ''),
             })
 
-        my_season_history_df = pd.DataFrame(season_rows)
+        # Only rebuild the df from season_rows when there's real data.
+        # If gw_history was empty (season not started), season_rows is []
+        # and my_season_history_df must stay as the placeholder built above —
+        # NOT get overwritten with an empty DataFrame.
+        if season_rows:
+            my_season_history_df = pd.DataFrame(season_rows)
+            my_season_history_df['Season Status'] = 'in_progress'
 
-        # Rank change (positive = moved UP — improved rank number is smaller)
-        my_season_history_df['Rank Change'] = (
-            my_season_history_df['Overall Rank'].shift(1) -
-            my_season_history_df['Overall Rank']
-        ).fillna(0).astype(int)
+            # Rank change (positive = moved UP — improved rank number is smaller)
+            my_season_history_df['Rank Change'] = (
+                my_season_history_df['Overall Rank'].shift(1) -
+                my_season_history_df['Overall Rank']
+            ).fillna(0).astype(int)
 
-        # Rank direction arrow — used by dashboard KPI card
-        my_season_history_df['Rank Direction'] = my_season_history_df['Rank Change'].apply(
-            lambda x: '↑ Improved' if x > 0 else ('↓ Dropped' if x < 0 else '→ Held')
-        )
+            # Rank direction arrow — used by dashboard KPI card
+            my_season_history_df['Rank Direction'] = my_season_history_df['Rank Change'].apply(
+                lambda x: '↑ Improved' if x > 0 else ('↓ Dropped' if x < 0 else '→ Held')
+            )
 
-        # Rank delta display string (e.g. "↑ +18,240" or "↓ -284,476")
-        my_season_history_df['Rank Delta Display'] = my_season_history_df['Rank Change'].apply(
-            lambda x: f"↑ +{x:,}" if x > 0 else (f"↓ {x:,}" if x < 0 else '→ No change')
-        )
+            # Rank delta display string (e.g. "↑ +18,240" or "↓ -284,476")
+            my_season_history_df['Rank Delta Display'] = my_season_history_df['Rank Change'].apply(
+                lambda x: f"↑ +{x:,}" if x > 0 else (f"↓ {x:,}" if x < 0 else '→ No change')
+            )
 
-        # Points delta display string (e.g. "+73 pts this GW")
-        my_season_history_df['Points Delta Display'] = my_season_history_df['GW Points'].apply(
-            lambda x: f"+{x} pts this GW"
-        )
+            # Points delta display string (e.g. "+73 pts this GW")
+            my_season_history_df['Points Delta Display'] = my_season_history_df['GW Points'].apply(
+                lambda x: f"+{x} pts this GW"
+            )
 
-        # Beat average string
-        my_season_history_df['vs Average Display'] = my_season_history_df['Points vs Average'].apply(
-            lambda x: f"+{x} vs avg" if x > 0 else f"{x} vs avg"
-        )
+            # Beat average string
+            my_season_history_df['vs Average Display'] = my_season_history_df['Points vs Average'].apply(
+                lambda x: f"+{x} vs avg" if x > 0 else f"{x} vs avg"
+            )
 
-        my_season_history_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
+            my_season_history_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
 
-        print(f"   ✅ Season history: {len(my_season_history_df)} gameweeks")
-        print(f"      Total points : {running_total} | "
-              f"Best rank: #{my_season_history_df['Overall Rank'].min():,}")
+            print(f"   ✅ Season history: {len(my_season_history_df)} gameweeks")
+            print(f"      Total points : {running_total} | "
+                  f"Best rank: #{my_season_history_df['Overall Rank'].min():,}")
 
     else:
-        print("   ⚠️  Could not fetch season history.")
+        print("   ⚠️  Could not fetch season history. Keeping previous sheet data.")
 
 except Exception as e:
     print(f"   ❌ Season history fetch failed: {e}")
@@ -1029,7 +1064,7 @@ try:
         f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/event/{current_gameweek}/picks/'
     )
 
-    if current_squad_data:
+    if current_squad_data and current_squad_data.get('picks'):
         picks         = current_squad_data.get('picks', [])
         active_chip   = current_squad_data.get('active_chip') or ''
         entry_history = current_squad_data.get('entry_history', {})
@@ -1158,11 +1193,26 @@ try:
         if active_chip:
             print(f"      🎯 Active chip: {active_chip}")
 
+    elif current_squad_data is not None:
+        # API responded but there are no picks yet — GW1 deadline hasn't
+        # passed / squad not locked in. Write an explicit placeholder so
+        # last season's final squad doesn't keep sitting on the sheet.
+        my_current_squad_df = pd.DataFrame([{
+            'Season Status':  'not_started',
+            'Message':        f'No squad locked in yet for GW{current_gameweek}',
+            'Is Starting':    '',
+            'xP':             0.0,
+            'Last Updated':   pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
+        }])
+        print(f"   ℹ️  No picks available yet for GW{current_gameweek}. Placeholder written.")
+
     else:
-        print(f"   ⚠️  Could not fetch GW{current_gameweek} squad.")
+        # Genuine fetch failure (network/API down) — don't touch the sheet,
+        # keep whatever was last written rather than overwriting good data.
+        print(f"   ⚠️  Could not fetch GW{current_gameweek} squad. Keeping previous sheet data.")
 
 except Exception as e:
-    print(f"   ❌ Current squad fetch failed: {e}")
+    print(f"   ❌ Current squad fetch failed: {e}. Keeping previous sheet data.")
 
 # ── 13c. TRANSFER HISTORY ─────────────────────────────────────────────────
 
@@ -1174,7 +1224,12 @@ try:
         f'https://fantasy.premierleague.com/api/entry/{MY_TEAM_ID}/transfers/'
     )
 
-    if transfers_data:
+    # BUG FIX: `if transfers_data:` was falsy for BOTH a real failure (None)
+    # AND a perfectly valid "no transfers made yet" response ([]) — since an
+    # empty list is falsy in Python. That meant a fresh season with zero
+    # transfers silently skipped the write and left last season's transfer
+    # log on the sheet. Checking `is not None` fixes it.
+    if transfers_data is not None:
         transfer_rows = []
 
         for t in transfers_data:
@@ -1201,19 +1256,27 @@ try:
                 'Transfer Time':    t.get('time', ''),
             })
 
-        my_transfers_df = pd.DataFrame(transfer_rows)
-        my_transfers_df = my_transfers_df.sort_values(
-            by=['Gameweek', 'Transfer Time'], ascending=[False, False]
-        ).reset_index(drop=True)
-        my_transfers_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
-
-        print(f"   ✅ Transfer history: {len(my_transfers_df)} transfers across the season")
+        if transfer_rows:
+            my_transfers_df = pd.DataFrame(transfer_rows)
+            my_transfers_df = my_transfers_df.sort_values(
+                by=['Gameweek', 'Transfer Time'], ascending=[False, False]
+            ).reset_index(drop=True)
+            my_transfers_df['Last Updated'] = pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC')
+            print(f"   ✅ Transfer history: {len(my_transfers_df)} transfers across the season")
+        else:
+            # Valid response, genuinely zero transfers this season yet.
+            my_transfers_df = pd.DataFrame([{
+                'Season Status': 'not_started',
+                'Message':       'No transfers made yet this season',
+                'Last Updated':  pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
+            }])
+            print("   ℹ️  No transfers yet this season. Placeholder written.")
 
     else:
-        print("   ⚠️  Could not fetch transfer history.")
+        print("   ⚠️  Could not fetch transfer history. Keeping previous sheet data.")
 
 except Exception as e:
-    print(f"   ❌ Transfer history fetch failed: {e}")
+    print(f"   ❌ Transfer history fetch failed: {e}. Keeping previous sheet data.")
 
 # ── 13d. MY FPL KPI SUMMARY ───────────────────────────────────────────────
 # Single-row table that the dashboard reads to populate the 5 KPI cards.
@@ -1226,7 +1289,46 @@ except Exception as e:
 my_kpi_df = pd.DataFrame()
 
 try:
-    if not my_season_history_df.empty and not my_current_squad_df.empty:
+    history_not_started = (
+        'Season Status' in my_season_history_df.columns and
+        my_season_history_df.iloc[-1].get('Season Status') == 'not_started'
+    )
+
+    if history_not_started or my_season_history_df.empty or my_current_squad_df.empty:
+        # Season hasn't produced real data yet — write an honest placeholder
+        # KPI row instead of either crashing on missing columns or (the old
+        # bug) silently skipping the write and leaving last season's totals
+        # sitting in the KPI Summary sheet looking current.
+        my_kpi_df = pd.DataFrame([{
+            'Season Status':             'not_started',
+            'Total Points':              0,
+            'GW Points':                 0,
+            'GW Points Delta Display':   '—',
+            'Overall Rank':              0,
+            'Rank Change':               0,
+            'Rank Direction':            '→',
+            'Rank Delta Display':        '—',
+            'Team Value':                0.0,
+            'Money In Bank':             0.0,
+            'xP Starting XI':            0.0,
+            'GW Average':                gw_averages.get(current_gameweek, 0),
+            'xP vs Average':             0.0,
+            'xP vs Avg Display':         '—',
+            'Free Transfers Next GW':    1,
+            'Hit Cost This GW':          0,
+            'Hit Display':               '—',
+            'Active Chip':               '',
+            'Current Gameweek':          int(current_gameweek),
+            'Season Best Rank':          0,
+            'Season Total Hits Cost':    0,
+            'Season Points On Bench':    0,
+            'GWs Beat Average':          0,
+            'Message':                   f'Season starts GW{current_gameweek} — check back after kickoff',
+            'Last Updated':              pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
+        }])
+        print(f"\n   ℹ️  KPI Summary: season not started — placeholder written for GW{current_gameweek}")
+
+    else:
 
         latest_gw = my_season_history_df.iloc[-1]
 
@@ -1258,6 +1360,7 @@ try:
         )
 
         kpi_row = {
+            'Season Status':              'in_progress',
             # Points KPI
             'Total Points':              int(latest_gw['Cumulative Points']),
             'GW Points':                 int(latest_gw['GW Points']),
