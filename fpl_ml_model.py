@@ -356,9 +356,15 @@ class AdvancedFPLPredictor:
         player_info = {p['id']: p for p in base['elements']}
 
         # Identify current GW
+        # BUG FIX: `next(gen, max(...))` evaluates the max(...) default
+        # EAGERLY as a function argument, regardless of whether the
+        # generator already matched. At the very start of a fresh season
+        # (zero finished GWs), that max() call on an empty sequence threw
+        # ValueError and crashed training before it even got going.
+        finished_ids = [e['id'] for e in base['events'] if e.get('is_finished')]
         current_gw = next(
             (e['id'] for e in base['events'] if e['is_current']),
-            max(e['id'] for e in base['events'] if e['is_finished'])
+            max(finished_ids) if finished_ids else 1
         )
 
         start_gw = max(1, current_gw - TRAINING_GW_LOOKBACK)
@@ -444,6 +450,9 @@ class AdvancedFPLPredictor:
             print("✓")
 
         df = pd.DataFrame(records)
+        if df.empty:
+            print(f"\n   ⚠️  No training samples available yet (0 finished GWs this season).")
+            return df
         print(f"\n   ✅ Training data built: {len(df):,} samples across {df['position'].value_counts().to_dict()}")
         return df
 
@@ -459,6 +468,13 @@ class AdvancedFPLPredictor:
         """
         print("\n🏋️  Training position-specific ensemble models...")
         raw = self._fetch_training_data()
+
+        if raw.empty:
+            print("   ⚠️  No historical GW data yet this season — skipping training. "
+                  "xP will fall back to Form until GW1 results are in.")
+            self.is_trained = False
+            return
+
         df  = _engineer_features(raw)
 
         # Only train on rows where we have a known target
@@ -516,9 +532,14 @@ class AdvancedFPLPredictor:
             print(f"   ✅ {pos}: RMSE={self.metrics[pos]['rmse']} | MAE={self.metrics[pos]['mae']} "
                   f"| Weights={[round(w,3) for w in weights]} | n={len(pos_df):,}")
 
-        self.is_trained = True
-        print("\n🎯 Training complete.")
-        self._log_metrics()
+        if not self.models:
+            print("   ⚠️  No position had enough data to train (very early season). "
+                  "Falling back to Form-based xP for this run.")
+            self.is_trained = False
+        else:
+            self.is_trained = True
+            print("\n🎯 Training complete.")
+            self._log_metrics()
 
     def _log_metrics(self):
         print("\n" + "="*60)
@@ -581,6 +602,15 @@ class AdvancedFPLPredictor:
             if pos not in self.models:
                 # Position model missing — use MID as fallback
                 pos = 'MID'
+
+            if pos not in self.models:
+                # MID fallback also unavailable (e.g. only DEF had enough
+                # samples this run) — don't crash, just use Form for this
+                # player instead of touching self.scalers[pos] blind.
+                xp_values.append(round(float(row.get('Form', 0) or 0), 2))
+                xp_confidence.append(0.0)
+                ai_ratings.append('N/A')
+                continue
 
             features_for_pos = [f for f in POSITION_FEATURES[pos] if f in feat]
             X = pd.DataFrame([feat])[features_for_pos].fillna(0)
