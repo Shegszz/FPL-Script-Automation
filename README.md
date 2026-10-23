@@ -37,5 +37,5 @@ flowchart LR
 Python | Pandas | Scikit-learn | XGBoost | FPL API | 
 Google Sheets API | Tableau | Google Apps Script
 
-## 📸 Demo
-Screenshots + Video walkthrough soon...
+## LIVE
+https://shegszz.github.io/fpl-dashboard/ 
