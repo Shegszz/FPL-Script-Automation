@@ -6,37 +6,31 @@ from datetime import datetime, timezone
 
 import requests
 import gspread
+import pandas as pd
 from google.oauth2.service_account import Credentials
+from gspread_dataframe import set_with_dataframe
 
 BASE_URL = "https://fantasy.premierleague.com/api"
-DEFAULT_TEAM_ID = "2551369"
+TEAM_ID = os.getenv("FPL_TEAM_ID", "2551369").strip()
 HISTORY_TAB = "My FPL - Season History"
 KPI_TAB = "My FPL - KPI Summary"
-TIMEOUT = 30
-
-HEADERS = [
-    "Season", "Season Status", "Team ID", "Manager", "Team Name",
-    "Gameweek", "GW Points", "Transfers Cost (Hits)", "Net GW Points",
-    "Cumulative Points", "Overall Rank", "GW Rank", "Team Value",
-    "Money In Bank", "Transfers", "Bench Points", "GW Average",
-    "GW Highest Score", "Points vs Average", "Last Updated UTC",
-]
+EXPECTED_SEASON = "2026/27"
 
 
-def get_json(url):
+def api_get(endpoint):
     response = requests.get(
-        url,
-        timeout=TIMEOUT,
-        headers={"User-Agent": "FPL-Season-History-Sync/1.0"},
+        f"{BASE_URL}/{endpoint.lstrip('/')}",
+        timeout=30,
+        headers={"User-Agent": "FPL-Analytics-Engine/1.0"},
     )
     response.raise_for_status()
     return response.json()
 
 
-def to_int(value, default=0):
+def number(value, default=0):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return default
 
 
@@ -50,34 +44,24 @@ def get_season(events):
                     datetime.fromisoformat(deadline.replace("Z", "+00:00"))
                 )
             except ValueError:
-                pass
+                continue
 
     if not dates:
-        raise RuntimeError("Could not determine the current FPL season.")
+        raise RuntimeError("Could not determine season from FPL events.")
 
-    start_year = min(dates).year
-    if min(dates).month <= 6:
-        start_year -= 1
-
-    return f"{start_year}/{str(start_year + 1)[-2:]}"
+    first = min(dates)
+    year = first.year if first.month >= 7 else first.year - 1
+    return f"{year}/{str(year + 1)[-2:]}"
 
 
-def connect_spreadsheet():
-    raw_credentials = os.getenv("GOOGLE_CREDENTIALS", "").strip()
-    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+def connect_sheet():
+    raw = os.getenv("GOOGLE_CREDENTIALS", "")
+    sheet_id = os.getenv("GOOGLE_SHEET_ID", "")
 
-    if not raw_credentials:
-        raise RuntimeError("Missing GOOGLE_CREDENTIALS secret.")
-    if not spreadsheet_id:
-        raise RuntimeError("Missing GOOGLE_SHEET_ID secret.")
+    if not raw or not sheet_id:
+        raise RuntimeError("Missing Google Sheets credentials or sheet ID.")
 
-    try:
-        info = json.loads(raw_credentials)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "GOOGLE_CREDENTIALS is not valid service-account JSON."
-        ) from exc
-
+    info = json.loads(raw)
     credentials = Credentials.from_service_account_info(
         info,
         scopes=[
@@ -85,50 +69,50 @@ def connect_spreadsheet():
             "https://www.googleapis.com/auth/drive",
         ],
     )
+    return gspread.authorize(credentials).open_by_key(sheet_id)
 
-    return gspread.authorize(credentials).open_by_key(spreadsheet_id)
 
-
-def get_worksheet(spreadsheet, title, rows=200, cols=30):
+def get_or_create_sheet(book, title, rows=300, cols=40):
     try:
-        return spreadsheet.worksheet(title)
+        return book.worksheet(title)
     except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(
-            title=title, rows=rows, cols=cols
-        )
+        return book.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def write_table(worksheet, headers, rows):
-    worksheet.clear()
-    worksheet.update(
-        range_name="A1",
-        values=[headers] + rows,
-        value_input_option="USER_ENTERED",
+def write_dataframe(book, title, dataframe):
+    ws = get_or_create_sheet(book, title)
+    ws.clear()
+    set_with_dataframe(
+        ws,
+        dataframe,
+        include_index=False,
+        include_column_header=True,
+        resize=True,
     )
+    ws.freeze(rows=1)
 
 
-def update_kpi_summary(spreadsheet, new_values):
-    worksheet = get_worksheet(spreadsheet, KPI_TAB, 20, 40)
-    old_data = worksheet.get_all_values()
+def update_kpi(book, values):
+    ws = get_or_create_sheet(book, KPI_TAB)
+    existing = ws.get_all_values()
 
-    # Preserve existing model/KPI columns managed by other scripts.
-    old_headers = old_data[0] if old_data else []
-    old_row = old_data[1] if len(old_data) > 1 else []
+    old_headers = existing[0] if existing else []
+    old_row = existing[1] if len(existing) > 1 else []
 
     merged = {}
     for i, header in enumerate(old_headers):
         if header:
             merged[header] = old_row[i] if i < len(old_row) else ""
 
-    merged.update(new_values)
+    merged.update(values)
 
     headers = list(old_headers)
     for key in merged:
         if key not in headers:
             headers.append(key)
 
-    worksheet.clear()
-    worksheet.update(
+    ws.clear()
+    ws.update(
         range_name="A1",
         values=[headers, [merged.get(h, "") for h in headers]],
         value_input_option="USER_ENTERED",
@@ -136,73 +120,101 @@ def update_kpi_summary(spreadsheet, new_values):
 
 
 def main():
-    team_id = os.getenv("FPL_TEAM_ID", DEFAULT_TEAM_ID).strip()
+    if not TEAM_ID.isdigit():
+        raise RuntimeError(f"Invalid FPL_TEAM_ID: {TEAM_ID}")
 
-    if not team_id.isdigit():
-        raise RuntimeError(
-            f"FPL_TEAM_ID must be numeric; received {team_id!r}."
-        )
+    print(f"Checking FPL entry {TEAM_ID}")
 
-    print(f"Fetching FPL data for entry {team_id}...")
-
-    bootstrap = get_json(f"{BASE_URL}/bootstrap-static/")
+    bootstrap = api_get("bootstrap-static/")
     events = bootstrap.get("events", [])
+
     if not events:
-        raise RuntimeError("FPL API returned no gameweeks.")
-
-    # Confirm the requested ID belongs to a real FPL entry.
-    entry = get_json(f"{BASE_URL}/entry/{team_id}/")
-    if str(entry.get("id")) != team_id:
-        raise RuntimeError("FPL entry ID verification failed.")
-
-    manager = " ".join(
-        str(entry.get(key, "")).strip()
-        for key in ("player_first_name", "player_last_name")
-    ).strip()
-    team_name = str(entry.get("name", "")).strip()
-
-    print(f"Verified entry ID: {team_id}")
-    print(f"Manager: {manager or 'Unknown'}")
-    print(f"Team: {team_name or 'Unknown'}")
-
-    history = get_json(f"{BASE_URL}/entry/{team_id}/history/")
-    current = history.get("current", [])
-
-    if not isinstance(current, list):
-        raise RuntimeError("Unexpected format in FPL history response.")
-
-    event_by_id = {
-        to_int(event.get("id")): event for event in events
-    }
-
-    # Keep only gameweeks that exist in the current bootstrap season.
-    current = [
-        row for row in current
-        if to_int(row.get("event")) in event_by_id
-    ]
-    current.sort(key=lambda row: to_int(row.get("event")))
-
-    if not current:
-        raise RuntimeError(
-            "The API returned no current-season history. "
-            "No sheet data was overwritten. Check the entry ID and API."
-        )
+        raise RuntimeError("No FPL events returned by the API.")
 
     season = get_season(events)
-    updated_at = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
 
+    if season != EXPECTED_SEASON:
+        raise RuntimeError(
+            f"Expected {EXPECTED_SEASON}, but FPL API indicates {season}. "
+            "Stopping to avoid writing the wrong season."
+        )
+
+    entry = api_get(f"entry/{TEAM_ID}/")
+
+    if str(entry.get("id")) != TEAM_ID:
+        raise RuntimeError("FPL entry ID verification failed.")
+
+    manager = " ".join([
+        str(entry.get("player_first_name", "")).strip(),
+        str(entry.get("player_last_name", "")).strip(),
+    ]).strip()
+
+    team_name = entry.get("name", "")
+
+    history = api_get(f"entry/{TEAM_ID}/history/")
+    current = history.get("current", [])
+
+    if not isinstance(current, list) or not current:
+        raise RuntimeError(
+            "No current-season gameweek history returned. "
+            "Existing Google Sheets data has not been overwritten."
+        )
+
+    event_lookup = {
+        number(event.get("id")): event for event in events
+    }
+
+    current = [
+        row for row in current
+        if number(row.get("event")) in event_lookup
+    ]
+    current.sort(key=lambda row: number(row.get("event")))
+
+    if not current:
+        raise RuntimeError("No valid current-season gameweeks found.")
+
+    chips = {
+        number(chip.get("event")): chip.get("name", "").replace("_", " ").title()
+        for chip in history.get("chips", [])
+    }
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows = []
 
-    for item in current:
-        gw = to_int(item.get("event"))
-        event = event_by_id[gw]
+    previous_rank = None
 
-        points = to_int(item.get("points"))
-        hits = to_int(item.get("event_transfers_cost"))
-        average = to_int(event.get("average_entry_score"))
-        highest = to_int(event.get("highest_score"))
+    for item in current:
+        gw = number(item.get("event"))
+        event = event_lookup[gw]
+
+        points = number(item.get("points"))
+        hits = number(item.get("event_transfers_cost"))
+        rank = number(item.get("overall_rank"))
+
+        average = number(event.get("average_entry_score"))
+        highest = number(event.get("highest_score"))
+
+        rank_change = (
+            previous_rank - rank
+            if previous_rank is not None and rank
+            else 0
+        )
+        previous_rank = rank if rank else previous_rank
+
+        rank_direction = (
+            "↑ Improved" if rank_change > 0
+            else "↓ Dropped" if rank_change < 0
+            else "→ Held"
+        )
+
+        rank_display = (
+            f"↑ +{rank_change:,}" if rank_change > 0
+            else f"↓ {rank_change:,}" if rank_change < 0
+            else "→ No change"
+        )
+
+        vs_average = points - average
+        vs_highest = points - highest
 
         if event.get("is_current"):
             status = "current"
@@ -211,68 +223,87 @@ def main():
         else:
             status = "played"
 
-        rows.append([
-            season,
-            status,
-            team_id,
-            manager,
-            team_name,
-            gw,
-            points,
-            hits,
-            points - hits,
-            to_int(item.get("total_points")),
-            to_int(item.get("overall_rank")),
-            to_int(item.get("rank")),
-            to_int(item.get("value")),
-            to_int(item.get("bank")),
-            to_int(item.get("event_transfers")),
-            to_int(item.get("points_on_bench")),
-            average,
-            highest,
-            points - average,
-            updated_at,
-        ])
+        rows.append({
+            "Season": season,
+            "Season Status": "in_progress",
+            "Team ID": TEAM_ID,
+            "Manager": manager,
+            "Team Name": team_name,
+            "Gameweek": gw,
+            "GW Points": points,
+            "Transfers Cost (Hits)": hits,
+            "Net GW Points": points - hits,
+            "Cumulative Points": number(item.get("total_points")),
+            "Overall Rank": rank,
+            "GW Rank": number(item.get("rank")),
+            "Team Value": round(number(item.get("value")) / 10, 1),
+            "Money In Bank": round(number(item.get("bank")) / 10, 1),
+            "Total Transfers Made": number(item.get("event_transfers")),
+            "Hit Taken": "Yes ❌" if hits > 0 else "No ✅",
+            "Points On Bench": number(item.get("points_on_bench")),
+            "GW Average": average,
+            "GW Highest Score": highest,
+            "Points vs Average": vs_average,
+            "Points vs TOTW": vs_highest,
+            "Beat Average": "Yes ✅" if vs_average > 0 else "No ❌",
+            "Chip Used": chips.get(gw, ""),
+            "Rank Change": rank_change,
+            "Rank Direction": rank_direction,
+            "Rank Delta Display": rank_display,
+            "Points Delta Display": f"+{points} pts this GW",
+            "vs Average Display": (
+                f"+{vs_average} vs avg" if vs_average > 0
+                else f"{vs_average} vs avg"
+            ),
+            "Last Updated": now,
+        })
 
-    spreadsheet = connect_spreadsheet()
+    dataframe = pd.DataFrame(rows)
 
-    history_sheet = get_worksheet(
-        spreadsheet, HISTORY_TAB, rows=250, cols=len(HEADERS)
-    )
-    write_table(history_sheet, HEADERS, rows)
+    # Safety check: never publish a history table with another season's rows.
+    if not (dataframe["Season"] == EXPECTED_SEASON).all():
+        raise RuntimeError("Season validation failed. Sheet not updated.")
 
-    best = max(rows, key=lambda row: to_int(row[6]))
+    book = connect_sheet()
+
+    # Replace the entire season history with verified current-season records.
+    write_dataframe(book, HISTORY_TAB, dataframe)
+
     latest = rows[-1]
+    best = max(rows, key=lambda row: row["GW Points"])
 
-    summary = {
+    # Preserve the other KPI fields produced by fpl_update.py.
+    update_kpi(book, {
         "Season": season,
-        "Season Status": "success",
-        "Team ID": team_id,
+        "Season Status": "in_progress",
+        "Team ID": TEAM_ID,
         "Manager": manager,
         "Team Name": team_name,
+        "Total Points": number(latest["Cumulative Points"]),
+        "Overall Rank": number(latest["Overall Rank"]),
+        "Current Gameweek": number(latest["Gameweek"]),
+        "Season Best Score": number(best["GW Points"]),
+        "Season Best GW": number(best["Gameweek"]),
         "Gameweeks Recorded": len(rows),
-        "Season Points": to_int(latest[9]),
-        "Latest GW": to_int(latest[5]),
-        "Latest GW Points": to_int(latest[6]),
-        "Season Best Score": to_int(best[6]),
-        "Season Best GW": to_int(best[5]),
-        "Last Updated UTC": updated_at,
+        "Last Updated": now,
         "History Sync Status": "SUCCESS",
         "History Sync Error": "",
-    }
+    })
 
-    update_kpi_summary(spreadsheet, summary)
-
-    print(f"Season detected: {season}")
-    print(f"Gameweeks written: {len(rows)}")
-    print(f"Highest recorded GW: {best[5]} ({best[6]} points)")
-    print(f"Latest GW: {latest[5]} ({latest[6]} points)")
-    print("Season history sync completed successfully.")
+    print("------------------------------------")
+    print(f"SEASON: {season}")
+    print(f"TEAM ID: {TEAM_ID}")
+    print(f"MANAGER: {manager}")
+    print(f"GAMEWEEKS: {len(rows)}")
+    print(f"BEST GW: GW{best['Gameweek']} - {best['GW Points']} points")
+    print(f"LATEST GW: GW{latest['Gameweek']}")
+    print("SUCCESS: Current season history updated.")
+    print("------------------------------------")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        print(f"SEASON HISTORY SYNC FAILED: {exc}", file=sys.stderr)
+    except Exception as error:
+        print(f"SEASON SYNC FAILED: {error}", file=sys.stderr)
         raise SystemExit(1)
