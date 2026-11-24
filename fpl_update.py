@@ -28,6 +28,7 @@ import os
 import json
 import re
 import time
+from datetime import datetime, timezone
 
 import gspread
 import numpy as np
@@ -196,6 +197,23 @@ players_raw = data['elements']
 teams       = {team['id']: team['short_name'] for team in data['teams']}
 positions   = {pos['id']: pos['singular_name'] for pos in data['element_types']}
 events      = data['events']
+
+# Derive the season from this bootstrap response so the history rows carry
+# an explicit season identifier for the dashboard.
+_event_dates = []
+for _event in events:
+    _deadline = _event.get('deadline_time')
+    if _deadline:
+        try:
+            _event_dates.append(datetime.fromisoformat(_deadline.replace('Z', '+00:00')))
+        except (TypeError, ValueError):
+            pass
+if not _event_dates:
+    raise RuntimeError("Could not determine FPL season from bootstrap events.")
+_season_start = min(_event_dates)
+_season_year = _season_start.year if _season_start.month >= 7 else _season_start.year - 1
+CURRENT_SEASON_NAME = f"{_season_year}/{str(_season_year + 1)[-2:]}"
+print(f"   ✅ FPL season detected: {CURRENT_SEASON_NAME}")
 teams_data  = data['teams']   # Full team list — passed to ML model
 
 # ---------------------------------------------------------------------------
@@ -956,7 +974,9 @@ try:
             # Writing an explicit placeholder clears that stale data and
             # gives the dashboard something concrete to detect.
             my_season_history_df = pd.DataFrame([{
+                'Season':         CURRENT_SEASON_NAME,
                 'Season Status': 'not_started',
+                'Team ID':        MY_TEAM_ID,
                 'Gameweek':      current_gameweek,
                 'Message':       f'Waiting for GW{current_gameweek} to kick off',
                 'Last Updated':  pd.to_datetime('now').strftime('%Y-%m-%d %H:%M UTC'),
@@ -985,11 +1005,13 @@ try:
             vs_high = gw_pts - gw_high
 
             season_rows.append({
+                'Season':                CURRENT_SEASON_NAME,
+                'Team ID':               MY_TEAM_ID,
                 'Gameweek':              gw_num,
                 'GW Points':             gw_pts,
                 'Transfers Cost (Hits)': hits,
                 'Net GW Points':         net_pts,
-                'Cumulative Points':     running_total,
+                'Cumulative Points':     gw.get('total_points', running_total),
                 'Overall Rank':          gw.get('overall_rank'),
                 'GW Rank':               gw.get('rank'),
                 'Team Value':            round(gw.get('value', 0) / 10, 1),
@@ -1046,10 +1068,14 @@ try:
                   f"Best rank: #{my_season_history_df['Overall Rank'].min():,}")
 
     else:
-        print("   ⚠️  Could not fetch season history. Keeping previous sheet data.")
+        raise RuntimeError(
+            f"Could not fetch season history for FPL entry {MY_TEAM_ID}; "
+            "refusing to leave previous-season data looking current."
+        )
 
 except Exception as e:
     print(f"   ❌ Season history fetch failed: {e}")
+    raise
 
 # ── 13b. CURRENT GW SQUAD ─────────────────────────────────────────────────
 # 15 players this GW — starting XI, bench, captain, VC.
@@ -1300,6 +1326,8 @@ try:
         # bug) silently skipping the write and leaving last season's totals
         # sitting in the KPI Summary sheet looking current.
         my_kpi_df = pd.DataFrame([{
+            'Season':                    CURRENT_SEASON_NAME,
+            'Team ID':                   MY_TEAM_ID,
             'Season Status':             'not_started',
             'Total Points':              0,
             'GW Points':                 0,
@@ -1360,6 +1388,8 @@ try:
         )
 
         kpi_row = {
+            'Season':                     CURRENT_SEASON_NAME,
+            'Team ID':                    MY_TEAM_ID,
             'Season Status':              'in_progress',
             # Points KPI
             'Total Points':              int(latest_gw['Cumulative Points']),
